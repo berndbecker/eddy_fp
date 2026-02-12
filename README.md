@@ -35,7 +35,7 @@ and for separating them from:
 - Fronts  
 - Sheet‑like boundaries.
 
-'''
+<code>
 f2fp_pkg/
 ├─ f2fp/
 │  ├─ __init__.py
@@ -49,7 +49,7 @@ f2fp_pkg/
 ├─ test_plot.py                   # reconstruct & plot, colored by GyreScore
 ├─ test_validate.py               # co-location validation against synthetic originals
 └─ README.md                      # usage and quick start
-'''
+</code>
 
 ## Key Concepts
 
