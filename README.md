@@ -35,6 +35,7 @@ and for separating them from:
 - Fronts  
 - Sheet‑like boundaries.
 
+'''
 f2fp_pkg/
 ├─ f2fp/
 │  ├─ __init__.py
@@ -48,6 +49,7 @@ f2fp_pkg/
 ├─ test_plot.py                   # reconstruct & plot, colored by GyreScore
 ├─ test_validate.py               # co-location validation against synthetic originals
 └─ README.md                      # usage and quick start
+'''
 
 ## Key Concepts
 
@@ -182,3 +184,38 @@ d50, d90, d99
 
 
 ## Package Structure
+# F2FP – Canonical Fingerprinting & Clustering of 3‑D Ocean Feature Point Clouds
+Bernd Becker, 2025–2026  
+Co-developed with Copilot
+
+## Overview
+F2FP turns unstructured (lon, lat, depth) edge point clouds into canonical fingerprints, clusters them (HDBSCAN‑2), reconstructs 3‑D shapes from fingerprints, validates vs originals, and plots on a 3‑D globe.
+
+## Contents
+- `f2fp/` module
+- Test scripts: build → cluster → plot → validate
+
+## Quick start
+```bash
+python test_build_fingerprints.py
+python test_cluster.py
+python test_plot.py  # creates eddies_test.html
+```
+
+## UMAP Embedding (optional)
+```python
+from f2fp import FingerprintDataset
+DS = FingerprintDataset.load_jsonl('run_fp.jsonl')
+DS.matrix_for_clustering(svd_components=128)
+emb = DS.embed_umap(n_neighbors=25, min_dist=0.1, n_components=2)
+labels, probs = DS.run_hdbscan(min_cluster_size=30, min_samples=8, use_umap=True)
+DS.assign_labels(labels, probs); DS.save_jsonl('run_fp.jsonl')
+```
+
+## GyreScore Coloring
+```python
+from f2fp import VerifyPlot
+vp = VerifyPlot('run_fp.jsonl', depth_stretch=100.0)
+vp.plot(vp.select(by='label', value='eddy')[:100], html_out='eddies_gyrescore.html',
+        show=False, color_by='gyrescore', palette='plasma')
+```
