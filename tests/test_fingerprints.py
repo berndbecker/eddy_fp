@@ -6,3 +6,5 @@ def test_fingerprint_metrics_present():
     fp = build_fingerprint(X)
     for k in ["linearity","planarity","scattering","circularity","nnz"]:
         assert k in fp.metrics
+
+test_fingerprint_metrics_present()

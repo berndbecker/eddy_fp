@@ -7,3 +7,5 @@ def test_cluster_pipeline():
     M = _stack_metrics(fps, ["linearity","planarity","scattering","circularity","nnz"])
     E = embed_features(M, 2, 42); labels = cluster_labels(M, 5, 42)
     assert E.shape == (20,2) and labels.shape==(20,)
+
+test_cluster_pipeline()

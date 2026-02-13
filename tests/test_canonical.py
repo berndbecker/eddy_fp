@@ -6,3 +6,6 @@ def test_canonical_grid_shape():
     Xc, pose = pca_align(X)
     grid = sparse_grid_12(Xc)
     assert grid['nx']==12 and grid['nnz']>0
+
+test_canonical_grid_shape()
+

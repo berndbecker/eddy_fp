@@ -1,0 +1,28 @@
+# General filetypes to ignore
+code_base/*.png
+__pycache__/
+*.py[cod]
+.vscode/
+*.swp
+*.swo
+code_base/*.nc
+code_base/*.pp
+code_base/*.pkl
+code_base/*.txt
+code_base/*.shp
+code_base/*.shx
+code_base/*.dbf
+code_base/*.prj
+code_base/*.cpg
+code_base/*.notinuse
+code_base/*.jpeg
+code_base/*.kmz
+code_base/*.db
+code_base/*.gif
+code_base/*.tar
+code_base/*.jpg
+code_base/*.mpeg
+code_base/*.gz
+
+# Project specific Directories and Files
+ncFiles/
