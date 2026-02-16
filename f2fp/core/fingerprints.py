@@ -34,6 +34,7 @@ def _basic_metrics(Xc: np.ndarray, grid: dict) -> dict:
 
 def build_fingerprint(X: np.ndarray, label: str | None = None) -> Fingerprint:
     """Build a fingerprint from input points."""
+    print (X)
     assert X.ndim == 2 and X.shape[1] == 3, "Input X must be (N,3) array"
     # Canonical alignment
     Xc, pose = pca_align(X)
