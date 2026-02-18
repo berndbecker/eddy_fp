@@ -13,6 +13,7 @@ def pca_align(X: np.ndarray) -> tuple[np.ndarray, Pose]:
     """Align points using PCA and return canonical coordinates and pose."""
     assert X.ndim == 2 and X.shape[1] == 3, "Input X must be (N,3) array"
     assert X.shape[0] > 0, "Input X must not be empty"
+    assert np.all(np.isfinite(X)), "Input X must be finite"
     # Compute centroid
     c = X.mean(axis=0, keepdims=True)
     X0 = X - c
