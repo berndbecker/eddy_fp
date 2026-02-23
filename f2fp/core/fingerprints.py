@@ -1,6 +1,26 @@
 from __future__ import annotations
+import sys
+
+if sys.flags.interactive:
+    print(
+        "I am in interactive mode! , use standard matplotlib backend with X windows support"
+    )
+else:
+    #   print('I am in batch mode!, use agg as backend for plotting ')
+    #   print(' (in agg you get no interactive session to look at/monitor production, \
+    #            ONLY if you imported matplotlib bfore mpl,use( Agg ))')
+    import matplotlib as mpl
+
+    mpl.use("Agg")
+
+from pyvista.trame.jupyter import launch_server
+
+import os
+os.environ.pop("DISPLAY", None)
+
 import numpy as np
-#from fast_hdbscan import HDBSCAN
+import pathlib
+from fast_hdbscan import HDBSCAN as FastHDBSCAN
 from dataclasses import dataclass
 try:
     from .canonical import pca_align, sparse_grid_12, Pose
@@ -165,6 +185,23 @@ def plot_features_from_json(path: str,
         plt.show()
     return emb
 
+def load_point_clouds_vtm(path: str) -> list[np.ndarray]:
+    """Load point clouds from a .vtm MultiBlock file."""
+    try:
+        import pyvista as pv
+        data = pv.read(path)
+        clouds = []
+        if isinstance(data, pv.MultiBlock):
+            for block in data:
+                if block is None:
+                    continue
+                pts = np.asarray(block.points, dtype=float) if hasattr(block, "points") else None
+                if pts is not None and pts.size:
+                    clouds.append(pts)
+        return clouds
+    except Exception:
+        return []
+
 def load_point_clouds_json(path: str, key: str = "points") -> list[np.ndarray]:
     """Load point cloud(s) from JSON or JSONL."""
     import json
@@ -187,7 +224,7 @@ def load_point_clouds_json(path: str, key: str = "points") -> list[np.ndarray]:
 def save_fingerprints_json(fps: list[dict], path: str) -> None:
     """Save fingerprints to JSON or JSONL, preserving structure."""
     import json
-    is_jsonl = path.endswith(".jsonl")
+    is_jsonl = path.name.endswith(".jsonl")
     with open(path, "w", encoding="utf-8") as fh:
         if is_jsonl:
             for rec in fps:
@@ -197,76 +234,85 @@ def save_fingerprints_json(fps: list[dict], path: str) -> None:
             json.dump(fps, fh, indent=2)
 
 def _cluster_points_raw(points: np.ndarray, min_cluster_size=20, eps=0.5) -> np.ndarray:
-    """Cluster raw points to select features (HDBSCAN -> DBSCAN fallback)."""
-    cluster_selection_method = "leaf"
-    algorithm = "kdtree"
-    max_cluster_size = int(len(points) * 0.5)
-    try:
-        import hdbscan
-        return hdbscan.HDBSCAN(min_cluster_size=min_cluster_size,
-                               cluster_selection_method=cluster_selection_method,
-                               algorithm=algorithm,
-                               max_cluster_size=max_cluster_size,).fit_predict(points)
-    except Exception:
-        try:
-            from sklearn.cluster import DBSCAN
-            return DBSCAN(eps=eps, min_samples=max(2, min_cluster_size // 2)).fit_predict(points)
-        except Exception:
-            return np.zeros(points.shape[0], dtype=int)
-
-def _split_clusters(points: np.ndarray, labels: np.ndarray, min_size: int = 1) -> list[np.ndarray]:
-    """Split points into clusters, dropping noise (-1)."""
-    points = np.asarray(points)
-    labels = np.asarray(labels)
+    """Cluster raw points using fast_hdbscan only."""
+    points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[1] != 3:
-        return []
-    if labels.shape[0] != points.shape[0]:
-        return []
+        points = points.reshape(-1, 3)
+    if points.size == 0 or points.shape[0] < 2:
+        return np.full((points.shape[0],), -1, dtype=int)
+    if FastHDBSCAN is None:
+        raise RuntimeError("fast_hdbscan is required but not installed")
+    clusterer = FastHDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=max(2, int(min_cluster_size // 5)),
+        metric="euclidean",
+        cluster_selection_epsilon=0.0
+    )
+    return clusterer.fit_predict(points)
+
+def _split_clusters(points: np.ndarray, labels: np.ndarray) -> list[np.ndarray]:
+    """Split points into clusters based on labels (ignore -1 noise)."""
+    points = np.asarray(points, dtype=float)
+    labels = np.asarray(labels)
     clusters = []
-    for lbl in sorted(set(labels.tolist())):
-        if lbl == -1:
+    for lbl in sorted(set(labels)):
+        if int(lbl) < 0:
             continue
         mask = labels == lbl
-        if mask.sum() < max(1, int(min_size)):
-            continue
-        clusters.append(points[mask])
+        if np.any(mask):
+            clusters.append(points[mask])
     return clusters
-
-def _silhouette_safe_points(X: np.ndarray, labels: np.ndarray) -> float:
-    """Compute silhouette score safely; return -1.0 on invalid cases."""
-    try:
-        from sklearn.metrics import silhouette_score
-        uniq = [u for u in np.unique(labels) if u != -1]
-        if len(uniq) < 2:
-            return -1.0
-        return float(silhouette_score(X, labels))
-    except Exception:
-        return -1.0
 
 def _cluster_points_raw_adaptive(points: np.ndarray,
                                  min_cluster_size=20,
                                  eps=0.5) -> np.ndarray:
-    """Try HDBSCAN and DBSCAN(auto-eps) and pick the best by silhouette."""
-    points = np.asarray(points, dtype=float)
-    best_labels = _cluster_points_raw(points, min_cluster_size=min_cluster_size, eps=eps)
-    best_score = _silhouette_safe_points(points, best_labels)
+    """No DBSCAN fallback; use fast_hdbscan only."""
+    return _cluster_points_raw(points, min_cluster_size=min_cluster_size, eps=eps)
 
-    try:
-        from sklearn.neighbors import NearestNeighbors
-        from sklearn.cluster import DBSCAN
-        nn = NearestNeighbors(n_neighbors=6).fit(points)
-        dists, _ = nn.kneighbors(points)
-        kdist = np.sort(dists[:, -1])
-        for q in (50, 70, 90):
-            cand_eps = float(np.percentile(kdist, q))
-            labels = DBSCAN(eps=cand_eps, min_samples=max(2, min_cluster_size // 2)).fit_predict(points)
-            score = _silhouette_safe_points(points, labels)
-            if score > best_score:
-                best_labels, best_score = labels, score
-    except Exception:
-        pass
+class IterativeHDBSCAN:
+    """Iterative HDBSCAN clustering."""
+    def __init__(self, min_cluster_size: int = 20, min_samples: int = 2, eps: float = 0.5):
+        self.min_cluster_size = min_cluster_size
+        self.min_samples = min_samples
+        self.eps = eps
+        self.metric = "euclidean"
+        self.cluster_selection_epsilon = 0.0
 
-    return best_labels
+    def _create_clusterer(self, min_cluster_size: int, min_samples: int):
+        if FastHDBSCAN is None:
+            raise RuntimeError("fast_hdbscan is required but not installed")
+        return FastHDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric=self.metric,
+            cluster_selection_epsilon=self.cluster_selection_epsilon
+        )
+
+    def fit(self, points: np.ndarray) -> list[dict]:
+        """Fit the model to the points."""
+        labels = _cluster_points_raw(points, min_cluster_size=self.min_cluster_size, eps=self.eps)
+        clusters = _split_clusters(points, labels)
+        if not clusters and points.size:
+            clusters = [points]
+
+        fps = []
+        for c in clusters:
+            fp = build_fingerprint(c)
+            fps.append(fp)
+        return fps
+
+    def fit_predict(self, points: np.ndarray) -> list[dict]:
+        """Fit the model to the points and return the labels."""
+        labels = _cluster_points_raw(points, min_cluster_size=self.min_cluster_size, eps=self.eps)
+        clusters = _split_clusters(points, labels)
+        if not clusters and points.size:
+            clusters = [points]
+
+        fps = []
+        for c in clusters:
+            fp = build_fingerprint(c)
+            fps.append(fp)
+        return fps
 
 def save_point_clouds_jsonl(path: str, clouds: list[np.ndarray]) -> None:
     """Save list of point clouds as JSONL (one cloud per line)."""
@@ -278,19 +324,46 @@ def save_point_clouds_jsonl(path: str, clouds: list[np.ndarray]) -> None:
             fh.write("\n")
 
 def save_point_clouds_vtk(prefix: str, clouds: list[np.ndarray]) -> None:
-    """Save list of point clouds as separate .vtk files."""
+    """Save list of point clouds as a single .vtk file (MultiBlock)."""
+    path = prefix if prefix.name.endswith(".vtk") else f"{prefix}.vtk"
+    if not clouds:
+        try:
+            from .synthetic import save_point_cloud_vtk
+        except Exception:
+            from synthetic import save_point_cloud_vtk
+        save_point_cloud_vtk(path, np.zeros((0, 3), dtype=float))
+        return
+
     try:
-        from .synthetic import save_point_cloud_vtk
-    except Exception:
-        from synthetic import save_point_cloud_vtk
-    for i, pts in enumerate(clouds):
-        save_point_cloud_vtk(f"{prefix}_{i}.vtk", np.asarray(pts, dtype=float))
+        print("save feature clouds as PolyData blocks as defined by cluster algorythm")
+        import pyvista as pv
+        blocks = pv.MultiBlock()
+        for i, pts in enumerate(clouds):
+            pts = np.asarray(pts, dtype=float)
+            if pts.size == 0:
+                continue
+            blocks.append(pv.PolyData(pts))
+        path = prefix if prefix.name.endswith(".vtm") else f"{prefix}.vtm"
+        blocks.save(path)
+    except Exception as e:
+        print("failed: ", e)
+        print(" Fallback: concatenate into a single point cloud")
+        try:
+            from .synthetic import save_point_cloud_vtk
+        except Exception:
+            from synthetic import save_point_cloud_vtk
+        pts_all = np.vstack([np.asarray(pts, dtype=float) for pts in clouds if np.asarray(pts).size])
+        print("save all feature clouds lumped together as mp array as it was before the cluster algorythm")
+        path = prefix if prefix.name.endswith(".vtk") else f"{prefix}.vtk"
+        save_point_cloud_vtk(path, pts_all)
+
+#
 
 def pipeline_cluster_points(points: np.ndarray,
                             min_cluster_size=20,
                             eps=0.5,
                             random_state=42,
-                            clusters_out: str | None = None,
+#                           clusters_out: str | None = None,
                             clusters_out_vtk: str | None = None,
                             max_points: int | None = None,
                             parallel: bool = True,
@@ -308,17 +381,24 @@ def pipeline_cluster_points(points: np.ndarray,
     except Exception:
         from cluster import embed_features, cluster_labels
 
-    points = _coerce_point_cloud(points)
-    if points.size == 0:
+    #points = _coerce_point_cloud(points)
+#   print("clusters_out: ", clusters_out)
+    print("clusters_out_vtk: ", clusters_out_vtk)
+    len_points =len(points)
+    print("points: ", len_points)
+    points = np.array(points)
+#   points = points.squeeze(axis=1)
+    if len_points == 0:
         return []
-    if max_points and points.shape[0] > max_points:
+    if max_points and len_points > max_points:
         rng = np.random.default_rng(random_state)
         idx = rng.choice(points.shape[0], size=max_points, replace=False)
         points = points[idx]
+    print("max_points, points[:10] ", max_points, points[:10], len_points)
     if first_stage == "iterative":
-        labels1 = _cluster_points_raw_iterative(points,
+        labels1 = _cluster_points_raw_adaptive(points,
                                                 min_cluster_size=min_cluster_size,
-                                                min_samples=max(2, min_cluster_size // 5))
+                                                eps=eps,)
     elif first_stage == "adaptive":
         labels1 = _cluster_points_raw_adaptive(points,
                                                min_cluster_size=min_cluster_size,
@@ -329,21 +409,28 @@ def pipeline_cluster_points(points: np.ndarray,
                                       eps=eps)
 
     clusters = _split_clusters(points, labels1)
-    if not clusters and points.size:
+    print("clusters[0] ", clusters[0])
+    print(" length clusters ", len(clusters))
+    print(" np.array clusters 0", clusters[0].shape)
+    print("labels1  ", labels1 )
+    if not clusters and len_points:
+        print(" no clusters  found! returning original point cloud")
         clusters = [points]
 
-    if clusters_out:
-        out = clusters_out.lower()
-        if out.endswith(".vtk"):
-            prefix = clusters_out[:-4]
-            save_point_clouds_vtk(prefix, clusters)
-            print("features saved to ", prefix, ".vtk")
+    if clusters_out_vtk:
+        #out = clusters_out_vtk.name.lower()
+        prefix = clusters_out_vtk.suffix
+        #if out.endswith(".vtm"):
+        if prefix == ".vtm":
+            #prefix = clusters_out_vtk.suffix
+            save_point_clouds_vtk(clusters_out_vtk, clusters)
+            print("features saved to ", clusters_out_vtk, " from save_point_clouds_vtk")
         else:
             save_point_clouds_jsonl(clusters_out, clusters)
-            print("features saved to ", clusters_out)
-    if clusters_out_vtk:
-        save_point_clouds_vtk(clusters_out_vtk, clusters)
-        print("features saved to ", clusters_out_vtk)
+            print("features saved to ", clusters_out, " from save_point_clouds_jsonl")
+#   if clusters_out_vtk:
+#       save_point_clouds_vtk(clusters_out_vtk, clusters)
+#       print("features saved to ", clusters_out_vtk, " from save_point_clouds_vtk")
 
     if parallel and len(clusters) > 1:
         from concurrent.futures import ProcessPoolExecutor
@@ -354,6 +441,7 @@ def pipeline_cluster_points(points: np.ndarray,
     fps_dicts = [to_dict(fp) for fp in fps]
 
     if not fps_dicts:
+        print("no fingerprints!")
         return []
 
     keys = ["linearity", "planarity", "scattering", "circularity", "nnz"]
@@ -446,12 +534,32 @@ def load_point_clouds_vtk(path: str) -> list[np.ndarray]:
         except Exception:
             return []
 
+def run_pipeline_from_points(points: np.ndarray,
+                             out_path: str,
+                             min_cluster_size=20,
+                             eps=0.5,
+                             random_state=42,
+                             features_out_vtk: str | None = None) -> list[dict]:
+    """Run pipeline directly on a point cloud array and save fingerprint JSON."""
+    points = np.asarray(points, dtype=float)
+    fps_dicts = pipeline_cluster_points(points,
+                                        min_cluster_size=min_cluster_size,
+                                        eps=eps,
+                                        random_state=random_state,
+                                        clusters_out_vtk=features_out_vtk)
+    save_fingerprints_json(fps_dicts, out_path)
+    print("fingerprints dictionary saved to ", out_path)
+    return fps_dicts
+
 def run_pipeline_from_vtk(vtk_path: str,
                           out_path: str,
                           min_cluster_size=20,
                           eps=0.5,
-                          random_state=42) -> list[dict]:
-    """Load point cloud(s) from .vtk, run pipeline, and save fingerprint JSON."""
+                          random_state=42,
+                          features_out_vtk: str | None = None) -> list[dict]:
+    """Load point cloud(s) from .vtk, run pipeline(also save cluster feature point clouds),
+    and save fingerprint JSON."""
+#   feature_clusters_out = (features_out_vtk.parent/features_out_vtk.stem).with_suffix(".vtm")
     clouds = load_point_clouds_vtk(vtk_path)
     if not clouds:
         return []
@@ -461,9 +569,34 @@ def run_pipeline_from_vtk(vtk_path: str,
                                         min_cluster_size=min_cluster_size,
                                         eps=eps,
                                         random_state=random_state,
-                                        clusters_out_vtk="features.vtk")
+#                                       clusters_out=feature_clusters_out,
+                                        clusters_out_vtk=features_out_vtk)
     save_fingerprints_json(fps_dicts, out_path)
+
     return fps_dicts
+
+def run_pipeline_from_vtk_not(vtk_path: str,
+                          out_path: str,
+                          min_cluster_size=20,
+                          eps=0.5,
+                          random_state=42) -> list[dict]:
+    """Load point cloud(s) from .vtk, run pipeline, and save fingerprint JSON."""
+    clouds = load_point_clouds_vtk(vtk_path)
+    if not clouds:
+        return []
+    print(len(clouds))
+    print(clouds[0].shape)
+    all_fps = []
+    #for points in clouds:
+    fps_dicts = pipeline_cluster_points(clouds, 
+                                        min_cluster_size=min_cluster_size,
+                                        eps=eps,
+                                        random_state=random_state,
+                                        clusters_out="features.vtm")
+    all_fps.extend(fps_dicts)
+    save_fingerprints_json(all_fps, out_path)
+    print("all finger prints saved to: ", out_path)
+    return all_fps
 
 def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int = 42) -> np.ndarray:
     """Approximate a point cloud from fingerprint grid + pose."""
@@ -502,56 +635,126 @@ def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int
     X0 = Xr @ R  # inverse of Xr = X0 @ R.T
     return X0 + c
 
+def _ecef_to_lonlatalt(X: np.ndarray) -> np.ndarray:
+    """Convert ECEF (meters) to lon/lat/alt (degrees, meters)."""
+    from pyproj import Transformer
+    X = np.asarray(X, dtype=float)
+    if X.size == 0:
+        return X
+    transformer = Transformer.from_crs("EPSG:4978", "EPSG:4979", always_xy=True)
+    lon, lat, alt = transformer.transform(X[:, 0], X[:, 1], X[:, 2])
+    return np.column_stack([lon, lat, alt])
+
+
 def plot_compare_with_original(labels_json_path: str,
                                original_points,
                                index: int = 0,
-                               n_points: int = 512):
+                               n_points: int = 128,
+                               zlevel_scale: float = 1.0/6371.):
+    
     """Load labeled fingerprints, reconstruct a feature, and compare to original."""
     fps = load_fingerprints_json(labels_json_path)
     if not fps:
+        print(" no fingerprints!")
         return None, None
 
-#   if isinstance(original_points, str):
-    if original_points.endswith(".vtk"):
-        clouds = load_point_clouds_vtk(original_points)
-    else:
-        clouds = load_point_clouds_json(original_points)
+    #if isinstance(original_points, str) and original_points.endswith(".vtm"):
+    clouds = load_point_clouds_vtm(original_points)
+    #elif isinstance(original_points, str) and original_points.endswith(".vtk"):
+    #    clouds = load_point_clouds_vtk(original_points)
+    #else:
+    #    clouds = load_point_clouds_json(original_points)
 
-    # GeoVista if available, else PyVista/Matplotlib fallback
+    if not clouds:
+        print(" no clouds!")
+        return None, None
+
     try:
         import geovista as gv
         import pyvista as pv
-        plotter = gv.GeoPlotter()
-        plotter.add_base_layer()
+#       pv.start_xvfb() 
+        plotter = gv.GeoPlotter(off_screen=True)
+        #plotter = gv.GeoPlotter()
 
-        X_all = []
-        for index, fp in enumerate(fps):
-            print(index)
+        # Add a globe layer if available (best-effort)
+#       if hasattr(plotter, "add_base_layer"):
+#           plotter.add_base_layer()
+
+        n = min(len(fps), len(clouds))
+        for i in range(n):
+            fp = fps[i]
+            print("index, fp[\"label\"], fp[\'metrics\'][\'circularity\']", index, fp["label"], fp['metrics']['circularity'])
             X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
-            print(index, fp, X_recon[:10])
-            print(len(X_recon))
-            X_orig = clouds[index] 
-            print(X_orig[:10])
-            plotter.add_mesh(pv.PolyData(X_orig), color="dodgerblue", point_size=5, render_points_as_spheres=True)
-            plotter.add_mesh(X_recon, color="orange", point_size=5, render_points_as_spheres=True)
+            X_orig = clouds[i]
+            print("reconstructed ", X_recon[:3])    
+            print("original      ", X_orig[:3])
+
+            # lon, lat, alt -> cartesian on the globe
+            points_orig = gv.common.to_cartesian(
+                X_orig[:, 0], X_orig[:, 1],
+                zlevel=X_orig[:, 2], zscale=zlevel_scale
+            )
+            points_recon = gv.common.to_cartesian(
+                X_recon[:, 0], X_recon[:, 1],
+                zlevel=X_recon[:, 2], zscale=zlevel_scale
+            )
+
+            # Debug: check for NaNs
+            print("points_orig nan?", np.isnan(points_orig).any(), "min/max", points_orig.min(), points_orig.max())
+            print("points_recon nan?", np.isnan(points_recon).any(), "min/max", points_recon.min(), points_recon.max())
+
+            # Plot as points (more reliable in GeoPlotter HTML)
+            #plotter.add_points(points_orig, color="blue", point_size=5, render_points_as_spheres=True)
+            #plotter.add_points(points_recon, color="lightgreen", point_size=5, render_points_as_spheres=True)
+           
+            # Plot as point clouds on the globe
+            plotter.add_mesh(pv.PolyData(points_orig), color="dodgerblue", point_size=5, render_points_as_spheres=True)
+            plotter.add_mesh(pv.PolyData(points_recon), color="orange", point_size=5, render_points_as_spheres=True)
+
+#       plotter.reset_camera() 
+        plotfile = "/home/users/bernd.becker/public_html/FRONTAL/compare2.html"
+        print(" make ", plotfile)
+        try:
+            plotter.export_html(plotfile)
+        except Exception as e:
+            plotfile = "/home/users/orca12/public_html/research/FRONTAL/compare2.html"
+            print(e, " save html to plotfile instead ", plotfile)
+            plotter.export_html(plotfile)
+
         plotter.show()
-        
-    except Exception:
+#       plotter.close()
+#       return plotfile, None
+    except Exception as e:
+        print("plot failed:", e)
         try:
             import pyvista as pv
             p = pv.Plotter()
             p.add_mesh(pv.PolyData(X_orig), color="dodgerblue", point_size=5, render_points_as_spheres=True)
             p.add_mesh(pv.PolyData(X_recon), color="orange", point_size=5, render_points_as_spheres=True)
             p.show()
-        except Exception:
-            import matplotlib.pyplot as plt
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection="3d")
-            if X_orig is not None:
-                ax.scatter(X_orig[:, 0], X_orig[:, 1], X_orig[:, 2], s=2, c="dodgerblue", label="original")
-            ax.scatter(X_recon[:, 0], X_recon[:, 1], X_recon[:, 2], s=2, c="orange", label="reconstructed")
-            ax.legend()
-            plt.show()
+        except Exception as e:
+            print("pyvista plot also failed:", e)
+
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    n = min(len(fps), len(clouds))
+    for i in range(n):
+        fp = fps[i]
+        print("index, fp[\"label\"], fp[\'metrics\'][\'circularity\']", index, fp["label"], fp['metrics']['circularity'])
+        X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
+        X_orig = clouds[i]
+
+        if X_orig is not None:
+#           ax.scatter(X_orig[:, 0], X_orig[:, 1], X_orig[:, 2], s=2, c="dodgerblue", label="original")
+#           ax.scatter(X_recon[:, 0], X_recon[:, 1], X_recon[:, 2], s=2, c="orange", label="reconstructed")
+            ax.scatter(X_orig[:, 0], X_orig[:, 1], X_orig[:, 2], s=2, c="dodgerblue")
+            ax.scatter(X_recon[:, 0], X_recon[:, 1], X_recon[:, 2], s=2, c="orange")
+
+    ax.legend()
+    plt.savefig("compare_scatter.png")
+    print("saved compare_scatter.png")
+    plt.show()
 
     return X_orig, X_recon
 
@@ -562,20 +765,26 @@ def main():
     except Exception:
         from synthetic import SynthConfig, mixed_point_cloud, save_point_cloud_vtk
 
-    # process one big point cloud to separate into features 
     # save features to "synthetic_feature_point_cloud.vtk"
-#   dummy = run_pipeline_from_vtk("synthetic_points.vtk", "single.jsonl")
-    dummy = run_pipeline_from_vtk("NW_atlantic_soundspeed_on_soundspeed_fronts.vtk", "single.jsonl")
-    # save fingerprints of features to "run_fp.jsonl")
-    fps_dicts = run_pipeline_from_vtk("synthetic_feature_point_cloud.vtk", "run_fp.jsonl")
-
 #   X = mixed_point_cloud(SynthConfig())
 #   save_point_cloud_vtk("synthetic_points.vtk", X)
+
+    indir = "/data/scratch/orca12/BBecker_frontal_assessment/output/"
+    filetag = "level1_gl_orca12_asm12_20260220_20260222T12/"
+
+    canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
+    canny_features_vtk = pathlib.Path("synthetic_points.vtk")
+    canny_features_vtm = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".vtm")
+    fingerprints_jsonl = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".jsonl")
+
+    # process one big point cloud to separate into features 
+    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
     # for index in range(0,31):
-    plot_compare_with_original("run_fp.jsonl", "synthetic_feature_point_cloud.vtk")
+    print("plot_compare_with_original( ", fingerprints_jsonl, canny_features_vtm, ")")
+    plot_compare_with_original(fingerprints_jsonl, canny_features_vtm)
 
 if __name__ == "__main__":
     main()

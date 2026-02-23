@@ -54,7 +54,24 @@ def cluster_labels(M: np.ndarray, min_cluster_size=20, random_state=42, force_n_
             return KMeans(n_clusters=force_n_clusters, random_state=random_state).fit_predict(M)
 
     return labels
-
+# ...existing code...
+def load_clouds_vtm(path: str) -> list[np.ndarray]:
+    """Load point clouds from a .vtm MultiBlock file."""
+    try:
+        import pyvista as pv
+        data = pv.read(path)
+        clouds = []
+        if isinstance(data, pv.MultiBlock):
+            for block in data:
+                if block is None:
+                    continue
+                pts = np.asarray(block.points, dtype=float) if hasattr(block, "points") else None
+                if pts is not None and pts.size:
+                    clouds.append(pts)
+        return clouds
+    except Exception:
+        return []
+# ...existing code...
 def cluster_labels_hdbscan_optimized(M: np.ndarray,
                                     min_cluster_size=20,
                                     random_state=42,
@@ -82,6 +99,8 @@ def cluster_labels_hdbscan_optimized(M: np.ndarray,
                 continue
             labels = hdbscan.HDBSCAN(min_cluster_size=candidate).fit_predict(M)
             score = _silhouette_safe(M, labels)
+            print("in custer_labels_hdbscan_optimized, step, score, best_score ", \
+                                                       step, score, best_score)
             if score > best_score:
                 best_mcs, best_labels, best_score = candidate, labels, score
                 improved = True
