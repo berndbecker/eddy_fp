@@ -18,6 +18,8 @@ from pyvista.trame.jupyter import launch_server
 import os
 os.environ.pop("DISPLAY", None)
 
+import time
+from contextlib import contextmanager
 import numpy as np
 import pathlib
 from fast_hdbscan import HDBSCAN as FastHDBSCAN
@@ -34,6 +36,22 @@ class Fingerprint:
     grid: dict
     metrics: dict
     label: str | None = None
+    
+DEBUG_FP = True
+
+def _dbg(*args, **kwargs):
+    if DEBUG_FP:
+        print(*args, **kwargs)
+
+@contextmanager
+def _timer(label: str):
+    if not DEBUG_FP:
+        yield
+        return
+    t0 = time.perf_counter()
+    yield
+    dt = time.perf_counter() - t0
+    _dbg(f"{label}: {dt:.3f}s")
 
 def _basic_metrics(Xc: np.ndarray, grid: dict) -> dict:
     """Compute basic shape metrics for a point cloud."""
@@ -116,15 +134,24 @@ def to_dict(fp: Fingerprint) -> dict:
         'label': fp.label
     }
 
+#def _stack_metrics(fps: list[dict], keys: list[str]) -> np.ndarray:
+#    """Stack selected metrics from fingerprints into a matrix."""
+#    assert len(fps) > 0, "fps list is empty"
+#    M = []
+#    for d in fps:
+#       m = d['metrics']
+#       # Extract metrics for each fingerprint
+#       M.append([float(m.get(k, 0.0)) for k in keys])
+#    return np.asarray(M, dtype=float)
+
 def _stack_metrics(fps: list[dict], keys: list[str]) -> np.ndarray:
     """Stack selected metrics from fingerprints into a matrix."""
     assert len(fps) > 0, "fps list is empty"
-    M = []
-    for d in fps:
+    M = np.empty((len(fps), len(keys)), dtype=float)
+    for i, d in enumerate(fps):
         m = d['metrics']
-        # Extract metrics for each fingerprint
-        M.append([float(m.get(k, 0.0)) for k in keys])
-    return np.asarray(M, dtype=float)
+        M[i, :] = [float(m.get(k, 0.0)) for k in keys]
+    return M
 
 def load_fingerprints_json(path: str) -> list[dict]:
     """Load fingerprints from a JSON or JSONL file."""
@@ -363,7 +390,7 @@ def pipeline_cluster_points(points: np.ndarray,
                             min_cluster_size=20,
                             eps=0.5,
                             random_state=42,
-#                           clusters_out: str | None = None,
+
                             clusters_out_vtk: str | None = None,
                             max_points: int | None = None,
                             parallel: bool = True,
@@ -381,73 +408,71 @@ def pipeline_cluster_points(points: np.ndarray,
     except Exception:
         from cluster import embed_features, cluster_labels
 
-    #points = _coerce_point_cloud(points)
-#   print("clusters_out: ", clusters_out)
-    print("clusters_out_vtk: ", clusters_out_vtk)
-    len_points =len(points)
-    print("points: ", len_points)
-    points = np.array(points)
-#   points = points.squeeze(axis=1)
+    _dbg("clusters_out_vtk: ", clusters_out_vtk)
+    points = np.asarray(points, dtype=float, order="C")
+    len_points = points.shape[0]
+    _dbg("points: ", len_points)
     if len_points == 0:
         return []
     if max_points and len_points > max_points:
         rng = np.random.default_rng(random_state)
-        idx = rng.choice(points.shape[0], size=max_points, replace=False)
+        idx = rng.choice(len_points, size=max_points, replace=False)
         points = points[idx]
-    print("max_points, points[:10] ", max_points, points[:10], len_points)
-    if first_stage == "iterative":
-        labels1 = _cluster_points_raw_adaptive(points,
-                                                min_cluster_size=min_cluster_size,
-                                                eps=eps,)
-    elif first_stage == "adaptive":
-        labels1 = _cluster_points_raw_adaptive(points,
-                                               min_cluster_size=min_cluster_size,
-                                               eps=eps)
-    else:
-        labels1 = _cluster_points_raw(points,
-                                      min_cluster_size=min_cluster_size,
-                                      eps=eps)
+        len_points = points.shape[0]
+    _dbg("max_points, points[:10] ", max_points, points[:10], len_points)
 
-    clusters = _split_clusters(points, labels1)
-    print("clusters[0] ", clusters[0])
-    print(" length clusters ", len(clusters))
-    print(" np.array clusters 0", clusters[0].shape)
-    print("labels1  ", labels1 )
+    with _timer("stage1 cluster"):
+        if first_stage == "iterative":
+            labels1 = _cluster_points_raw_adaptive(points,
+                                                   min_cluster_size=min_cluster_size,
+                                                   eps=eps,)
+        elif first_stage == "adaptive":
+            labels1 = _cluster_points_raw_adaptive(points,
+                                                   min_cluster_size=min_cluster_size,
+                                                   eps=eps)
+        else:
+            labels1 = _cluster_points_raw(points,
+                                          min_cluster_size=min_cluster_size,
+                                          eps=eps)
+
+    with _timer("split clusters"):
+        clusters = _split_clusters(points, labels1)
+    _dbg("clusters[0] ", clusters[0] if clusters else None)
+    _dbg("length clusters ", len(clusters))
+    _dbg("labels1  ", labels1)
     if not clusters and len_points:
-        print(" no clusters  found! returning original point cloud")
+        _dbg("no clusters found! returning original point cloud")
         clusters = [points]
 
     if clusters_out_vtk:
-        #out = clusters_out_vtk.name.lower()
         prefix = clusters_out_vtk.suffix
-        #if out.endswith(".vtm"):
         if prefix == ".vtm":
-            #prefix = clusters_out_vtk.suffix
             save_point_clouds_vtk(clusters_out_vtk, clusters)
-            print("features saved to ", clusters_out_vtk, " from save_point_clouds_vtk")
+            _dbg("features saved to ", clusters_out_vtk, " from save_point_clouds_vtk")
         else:
             save_point_clouds_jsonl(clusters_out, clusters)
-            print("features saved to ", clusters_out, " from save_point_clouds_jsonl")
-#   if clusters_out_vtk:
-#       save_point_clouds_vtk(clusters_out_vtk, clusters)
-#       print("features saved to ", clusters_out_vtk, " from save_point_clouds_vtk")
+            _dbg("features saved to ", clusters_out, " from save_point_clouds_jsonl")
 
-    if parallel and len(clusters) > 1:
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            fps = list(ex.map(build_fingerprint, clusters))
-    else:
-        fps = [build_fingerprint(c) for c in clusters]
+    # Avoid ProcessPool overhead for small workloads
+    use_parallel = parallel and len(clusters) > 4
+    with _timer("build fingerprints"):
+        if use_parallel:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                fps = list(ex.map(build_fingerprint, clusters))
+        else:
+            fps = [build_fingerprint(c) for c in clusters]
     fps_dicts = [to_dict(fp) for fp in fps]
 
     if not fps_dicts:
-        print("no fingerprints!")
+        _dbg("no fingerprints!")
         return []
 
     keys = ["linearity", "planarity", "scattering", "circularity", "nnz"]
-    M = _stack_metrics(fps_dicts, keys)
-    emb = embed_features(M)
-    labels2 = cluster_labels(emb, min_cluster_size=min_cluster_size, random_state=random_state)
+    with _timer("stage2 embed+cluster"):
+        M = _stack_metrics(fps_dicts, keys)
+        emb = embed_features(M)
+        labels2 = cluster_labels(emb, min_cluster_size=min_cluster_size, random_state=random_state)
 
     uniq = sorted(set(int(x) for x in labels2))
     mapping = {lbl: f"eddy_{i}" for i, lbl in enumerate(uniq)}
@@ -474,21 +499,7 @@ def run_pipeline_from_json(points_path: str,
     save_fingerprints_json(fps_dicts, out_path)
     return fps_dicts
 
-def run_pipeline_from_points(points: np.ndarray,
-                             out_path: str,
-                             min_cluster_size=20,
-                             eps=0.5,
-                             random_state=42) -> list[dict]:
-    """Run pipeline directly on a point cloud array and save fingerprint JSON."""
-    points = np.asarray(points, dtype=float)
-    fps_dicts = pipeline_cluster_points(points,
-                                        min_cluster_size=min_cluster_size,
-                                        eps=eps,
-                                        random_state=random_state,
-                                        clusters_out_vtk="features.vtk")
-    save_fingerprints_json(fps_dicts, out_path)
-    print("fingerprints dictionary saved to ", out_path)
-    return fps_dicts
+
 
 def load_point_clouds_vtk(path: str) -> list[np.ndarray]:
     """Load point cloud(s) from a .vtk file."""
@@ -563,7 +574,7 @@ def run_pipeline_from_vtk(vtk_path: str,
     clouds = load_point_clouds_vtk(vtk_path)
     if not clouds:
         return []
-    points = clouds[0] if len(clouds) == 1 else np.vstack(clouds)
+    points = clouds[0] if len(clouds) == 1 else np.concatenate(clouds, axis=0)
 
     fps_dicts = pipeline_cluster_points(points,
                                         min_cluster_size=min_cluster_size,
@@ -575,28 +586,6 @@ def run_pipeline_from_vtk(vtk_path: str,
 
     return fps_dicts
 
-def run_pipeline_from_vtk_not(vtk_path: str,
-                          out_path: str,
-                          min_cluster_size=20,
-                          eps=0.5,
-                          random_state=42) -> list[dict]:
-    """Load point cloud(s) from .vtk, run pipeline, and save fingerprint JSON."""
-    clouds = load_point_clouds_vtk(vtk_path)
-    if not clouds:
-        return []
-    print(len(clouds))
-    print(clouds[0].shape)
-    all_fps = []
-    #for points in clouds:
-    fps_dicts = pipeline_cluster_points(clouds, 
-                                        min_cluster_size=min_cluster_size,
-                                        eps=eps,
-                                        random_state=random_state,
-                                        clusters_out="features.vtm")
-    all_fps.extend(fps_dicts)
-    save_fingerprints_json(all_fps, out_path)
-    print("all finger prints saved to: ", out_path)
-    return all_fps
 
 def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int = 42) -> np.ndarray:
     """Approximate a point cloud from fingerprint grid + pose."""
@@ -646,7 +635,7 @@ def _ecef_to_lonlatalt(X: np.ndarray) -> np.ndarray:
     return np.column_stack([lon, lat, alt])
 
 
-def plot_compare_with_original(labels_json_path: str,
+def plot_compare_with_original(labels_json_path: str, 
                                original_points,
                                index: int = 0,
                                n_points: int = 128,
@@ -683,11 +672,11 @@ def plot_compare_with_original(labels_json_path: str,
         n = min(len(fps), len(clouds))
         for i in range(n):
             fp = fps[i]
-            print("index, fp[\"label\"], fp[\'metrics\'][\'circularity\']", index, fp["label"], fp['metrics']['circularity'])
+            _dbg("index, fp[\"label\"], fp[\'metrics\'][\'circularity\']", index, fp["label"], fp['metrics']['circularity'])
             X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
             X_orig = clouds[i]
-            print("reconstructed ", X_recon[:3])    
-            print("original      ", X_orig[:3])
+            _dbg("reconstructed ", X_recon[:3])    
+            _dbg("original      ", X_orig[:3])
 
             # lon, lat, alt -> cartesian on the globe
             points_orig = gv.common.to_cartesian(
@@ -700,8 +689,8 @@ def plot_compare_with_original(labels_json_path: str,
             )
 
             # Debug: check for NaNs
-            print("points_orig nan?", np.isnan(points_orig).any(), "min/max", points_orig.min(), points_orig.max())
-            print("points_recon nan?", np.isnan(points_recon).any(), "min/max", points_recon.min(), points_recon.max())
+            _dbg("points_orig nan?", np.isnan(points_orig).any(), "min/max", points_orig.min(), points_orig.max())
+            _dbg("points_recon nan?", np.isnan(points_recon).any(), "min/max", points_recon.min(), points_recon.max())
 
             # Plot as points (more reliable in GeoPlotter HTML)
             #plotter.add_points(points_orig, color="blue", point_size=5, render_points_as_spheres=True)
@@ -712,16 +701,19 @@ def plot_compare_with_original(labels_json_path: str,
             plotter.add_mesh(pv.PolyData(points_recon), color="orange", point_size=5, render_points_as_spheres=True)
 
 #       plotter.reset_camera() 
-        plotfile = "/home/users/bernd.becker/public_html/FRONTAL/compare2.html"
+        html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
+        html_dir = pathlib.Path("/home/users/bernd.becker/public_html/FRONTAL/")
+        plotfile = html_dir / html_file
         print(" make ", plotfile)
         try:
             plotter.export_html(plotfile)
         except Exception as e:
-            plotfile = "/home/users/orca12/public_html/research/FRONTAL/compare2.html"
+            html_dir = pathlib.Path("/home/users/orca12/public_html/research/FRONTAL" )
+            plotfile = html_dir / html_file
             print(e, " save html to plotfile instead ", plotfile)
             plotter.export_html(plotfile)
 
-        plotter.show()
+#       plotter.show()
 #       plotter.close()
 #       return plotfile, None
     except Exception as e:
@@ -773,12 +765,12 @@ def main():
     filetag = "level1_gl_orca12_asm12_20260220_20260222T12/"
 
     canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
-    canny_features_vtk = pathlib.Path("synthetic_points.vtk")
+    #canny_features_vtk = pathlib.Path("synthetic_points.vtk")
     canny_features_vtm = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".vtm")
     fingerprints_jsonl = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".jsonl")
 
     # process one big point cloud to separate into features 
-    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, features_out_vtk=canny_features_vtm)
+    fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
