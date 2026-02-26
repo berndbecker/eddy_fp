@@ -1061,8 +1061,8 @@ def main():
     print(" point cloud from : ", canny_features_vtk) 
     print(" features point clouds to : ", canny_features_vtm) 
     print(" features finger prints to : ", fingerprints_jsonl) 
-    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
-    #                                   features_out_vtk=canny_features_vtm)
+    fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
+                                       features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
