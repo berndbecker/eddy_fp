@@ -15,8 +15,9 @@ else:
     import os
     os.environ.pop("DISPLAY", None)
 
+import geovista as gv
+import pyvista as pv
 from pyvista.trame.jupyter import launch_server
-
 
 import time
 from contextlib import contextmanager
@@ -24,8 +25,9 @@ import numpy as np
 import pathlib
 import cartopy.crs as ccrs
 from pyproj import CRS, Transformer
+from collections import Counter
+import matplotlib.cm as cm
 
-from geovista import crs as gvcrs
 #from geovista.pantry.meshes import ZLEVEL_SCALE_CLOUD  # == 0.00001 ,1.e-5
 ZLEVEL_SCALE_CLOUD=1./6371000.  # NOT! == 0.00001 ,1.e-5
 
@@ -124,7 +126,7 @@ def _normalize_metrics(metrics: dict) -> dict:
         "nnz": int(metrics.get("nnz", 0)),
     }
 
-GRID_SIZE = 24  # higher resolution for tighter reconstruction
+GRID_SIZE = 22  # higher resolution for tighter reconstruction
 
 def sparse_grid_12(Xc: np.ndarray) -> dict:
     """Create a sparse grid representation from canonical coordinates."""
@@ -227,7 +229,6 @@ def plot_features_from_json(path: str,
     emb = embed_features(M)
 
     labels = [fp.get("type_label", "unknown") for fp in fps]
-    print(labels)
     label_set = sorted(set(labels))
     label_to_int = {l: i for i, l in enumerate(label_set)}
     color_vals = [label_to_int[l] for l in labels]
@@ -274,7 +275,7 @@ def load_point_clouds_vtm(path: str) -> list[np.ndarray]:
                 pts = np.asarray(block.points, dtype=float) if hasattr(block, "points") else None
                 if pts is not None and pts.size:
                     clouds.append(pts)
-        return clouds
+        return clouds, data
     except Exception:
         return []
 
@@ -414,7 +415,7 @@ def save_point_clouds_vtk(prefix: str, clouds: list[np.ndarray]) -> None:
         return
 
     try:
-        print("save feature clouds as PolyData blocks as defined by cluster algorythm")
+        print("save feature clouds as PolyData blocks as defined by cluster algorithm")
         import pyvista as pv
         blocks = pv.MultiBlock()
         for i, pts in enumerate(clouds):
@@ -432,7 +433,7 @@ def save_point_clouds_vtk(prefix: str, clouds: list[np.ndarray]) -> None:
         except Exception:
             from synthetic import save_point_cloud_vtk
         pts_all = np.vstack([np.asarray(pts, dtype=float) for pts in clouds if np.asarray(pts).size])
-        print("save all feature clouds lumped together as mp array as it was before the cluster algorythm")
+        print("save all feature clouds lumped together as mp array as it was before the cluster algorithm")
         path = prefix if prefix.name.endswith(".vtk") else f"{prefix}.vtk"
         save_point_cloud_vtk(path, pts_all)
 
@@ -440,8 +441,8 @@ def _cluster_points_raw_iterative(points: np.ndarray, \
                                   min_cluster_size=20, \
                                   eps=0.5, \
                                   max_iters: int = 10, \
-                                  eps_decay: float = 0.85, \
-                                  min_eps: float = 1e-9):
+                                  eps_decay: float = 0.7, \
+                                  min_eps: float = 1e-8):
     """Iteratively tighten eps to reach a stable clustering, with hard stop."""
     eps_i = float(eps)
     last_labels = None
@@ -463,14 +464,21 @@ def _type_label_from_metrics(m: dict) -> str:
     p = float(m.get("planarity", 0.0))
     s = float(m.get("scattering", 0.0))
 
-    if c >= 0.6 and s <= 0.2:
+# Eddy: strong circularity
+    if c >= 0.9:
         return "eddy"
-    if 0.3 <= c < 0.6 and s <= 0.3:
-        return "swirl"
-    if p >= 0.6 and c < 0.2:
+
+    # Front: high planarity, low circularity
+    if p >= 0.2 and c < 0.1:
         return "front"
-    if l >= 0.6 and p < 0.3:
+
+    # Curtain: high linearity, low planarity
+    if l >= 0.9 and p < 0.1:
         return "curtain"
+
+    # Swirl: moderate linearity/planarity, low circularity
+    if 0.5 <= l < 0.9 and 0.05 <= p < 0.2 and c < 0.1:
+        return "swirl"
     return "other"
 
 def pipeline_cluster_points(points: np.ndarray,
@@ -491,7 +499,6 @@ def pipeline_cluster_points(points: np.ndarray,
     Returns list of fingerprint dicts with consistent label strings.
     """
     len_points = points.shape[0]
-    min_cluster_size = int(len_points/100)
     with _timer("stage1 cluster"):
         if first_stage == "iterative":
             labels1 = _cluster_points_raw_iterative(points,
@@ -530,9 +537,9 @@ def pipeline_cluster_points(points: np.ndarray,
     clusters = _split_clusters(points, labels1)
 
     _progress(f"[fp] stage1 done, {len(clusters)} clusters")
-    _dbg("clusters[0] ", clusters[0] if clusters else None)
+    _dbg("clusters[0] ", clusters[0][:3] if clusters else None)
     _dbg("length clusters ", len(clusters))
-    _dbg("labels1  ", labels1)
+#   _dbg("labels1  ", labels1)
     if not clusters and len_points:
         _dbg("no clusters found! returning original point cloud")
         clusters = [points]
@@ -602,21 +609,20 @@ def run_pipeline_from_json(points_path: str,
 
 
 def load_point_clouds_vtk(path: str) -> list[np.ndarray]:
-    """Load point cloud(s) from a .vtk file."""
+    """Load point cloud(s) from a .vtk file.
+    return mpoints and mesh"""
     try:
         import pyvista as pv
         data = pv.read(path)
 
-        cloudb = data.combine()
+        mesh = data.combine()
         del blocks
-        cloud = cloudb.clean(tolerance=1e-6)
-        del cloudb
+        mesh = mesh.clean(tolerance=1e-6)
         print("point cloud read from ", path)
-        print("len(cloud.points) = ",len(cloud.points))
-        mpoints = cloud.points
-        del cloud
+        print("len(mesh.points) = ",len(mesh.points))
+        mpoints = mesh.points
         print("len(mpoints) = ",len(mpoints))
-        return mpoints
+        return mpoints, mesh
 
         clouds = []
         if isinstance(data, pv.MultiBlock):
@@ -676,8 +682,8 @@ def run_pipeline_from_points(points: np.ndarray,
 
 def run_pipeline_from_vtk(vtk_path: str,
                           out_path: str,
-                          min_cluster_size=20000,
-                          eps=0.00005,
+                          min_cluster_size=1450,
+                          eps=0.0001,
                           random_state=42,
                           features_out_vtk: str | None = None) -> list[dict]:
     """Load point cloud(s) from .vtk, run pipeline(also save cluster feature point clouds),
@@ -796,7 +802,7 @@ def to_dict(fp: Fingerprint) -> dict:
 def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int = 42,
                                         jitter: bool = True,
                                         cell_size_scale: float = 0.5,
-                                        jitter_scale: float = 1.5) -> np.ndarray:
+                                        jitter_scale: float = 1.2) -> np.ndarray:
     """Approximate a point cloud from fingerprint grid + pose."""
     rng = np.random.default_rng(seed)
     grid = fp.get("grid", {})
@@ -873,6 +879,15 @@ def _ecef_to_lonlatalt(X: np.ndarray) -> np.ndarray:
     lon, lat, alt = transformer.transform(X[:, 0], X[:, 1], X[:, 2])
     return np.column_stack([lon, lat, alt])
 
+def summarize_metrics(fps: list[dict]):
+    keys = ["linearity", "planarity", "scattering", "circularity"]
+    for k in keys:
+        vals = np.array([fp["metrics"].get(k, 0.0) for fp in fps], dtype=float)
+        q = np.quantile(vals, [0, 0.1, 0.5, 0.9, 1.0])
+        print(k, "q0/q10/q50/q90/q100 =", q, "mean", vals.mean())
+
+    labels2 = [fp.get("type_label", "unknown") for fp in fps]
+    _dbg("counts(labels2)  ", Counter(labels2))
 
 def _downsample_points(X: np.ndarray, max_points: int | None, seed: int = 42) -> np.ndarray:
     if X is None:
@@ -901,11 +916,13 @@ def plot_compare_with_original(labels_json_path: str,
     _dbg("fps[0].keys", fps[0].keys() if fps else None)
     _dbg("fps[0][\"grid\"].keys() ", fps[0]["grid"].keys())
 
+    summarize_metrics(fps)
+
     if not fps:
         print(" no fingerprints!")
         return None, None
 
-    clouds = load_point_clouds_vtm(original_points)
+    clouds, mesh = load_point_clouds_vtm(original_points)
     if not clouds:
         print(" no clouds!")
         return None, None
@@ -925,30 +942,28 @@ def plot_compare_with_original(labels_json_path: str,
     print("ZLEVEL_SCALE_CLOUD= ", ZLEVEL_SCALE_CLOUD)
     print("zlevel_scale= ", zlevel_scale)
     try:
-        import geovista as gv
-        import pyvista as pv
         if sys.flags.interactive:
             plotter = gv.GeoPlotter(off_screen=True)
         else:
             plotter = gv.GeoPlotter(off_screen=False)
         
-        palette = ["dodgerblue", "orange", "limegreen", "magenta", "gold", "cyan", "salmon", "purple"]
+        label_set = sorted({fp.get("type_label", fp.get("label", "unknown")) for fp in fps})
+        cmap = cm.get_cmap("tab10", len(label_set))
+        color_map = {lab: cmap(i) for i, lab in enumerate(label_set)}
+
         def _subtype_color(fp):
-            st =  fp.get("type_label", "unknown")
-            key = str(st)
-            index = hash(key) % len(palette)
-            _dbg(st, key, index, palette[index])
-            return palette[index]
+            lab = fp.get("type_label", fp.get("label", "unknown"))
+            return color_map[lab]
 
         for i in indices:
             fp = fps[i]
             X_orig = clouds[i]
             len_X_orig = len(X_orig)
-            _dbg("index, type_label, circularity, len(cloud) ",
-                 i, fp.get("type_label"), fp["metrics"].get("circularity"), len_X_orig)
+            #_dbg("index, type_label, circularity, len(cloud) ",
+            #     i, fp.get("type_label"), fp["metrics"].get("circularity"), len_X_orig)
 #           n_points=len_X_orig
-            max_points_per_cloud = n_points
-            X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
+            max_points_per_cloud = min(len_X_orig, n_points)
+            X_recon = reconstruct_points_from_fingerprint(fp, n_points=max_points_per_cloud )
 
             X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
             #_dbg("X_orig [:3] ", X_orig [:3])
@@ -957,27 +972,12 @@ def plot_compare_with_original(labels_json_path: str,
 
 #           X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
             # create the point-cloud from the sample data
-            mesh_orig = gv.Transform.from_points(
-                X_orig[:, 0], X_orig[:, 1],
-                data=X_orig[:, 2],
-                #       data=sample.data,
-                name="Original data",
-                zlevel=-X_orig[:, 2],  # this minus sign stays!
-                zscale=ZLEVEL_SCALE_CLOUD,
-            )
+            mesh_orig = pv.PolyData(X_orig)
+            mesh_recon = pv.PolyData(X_recon)
 
-            mesh_recon = gv.Transform.from_points(
-                X_recon[:, 0], X_recon[:, 1],
-                data=X_recon[:, 2],
-                #       data=sample.data,
-                name="Reconstructed data",
-                zlevel=-X_recon[:, 2],  # this minus sign stays!
-                zscale=ZLEVEL_SCALE_CLOUD,
-            )
+            #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
 
-            _dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
-
-            plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
+            #plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
             plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
 
         html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
@@ -1012,7 +1012,7 @@ def plot_compare_with_original(labels_json_path: str,
         ax = fig.add_subplot(111, projection="3d")
         for i in indices:
             fp = fps[i]
-            print("index, type_label, circularity", i, fp.get("type_label"), fp["metrics"].get("circularity"))
+            #_dbg("index, type_label, circularity", i, fp.get("type_label"), fp["metrics"].get("circularity"))
             X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
             X_orig = clouds[i]
             X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
@@ -1051,9 +1051,9 @@ def main():
     indir = "/data/scratch/orca12/BBecker_frontal_assessment/output/"
     filetag = "level1_gl_orca12_asm12_20260220_20260222T12/"
 
-#   canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
-    canny_features_vtk = pathlib.Path(indir + filetag + "CSV/NW_atlantic_salinity_on_salinity_fronts.vtk")
-    canny_features_vtk = pathlib.Path("synthetic_feature_point_cloud.vtk")
+    canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
+    #canny_features_vtk = pathlib.Path(indir + filetag + "CSV/NW_atlantic_salinity_on_salinity_fronts.vtk")
+    #canny_features_vtk = pathlib.Path("synthetic_feature_point_cloud.vtk")
     canny_features_vtm = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".vtm")
     fingerprints_jsonl = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".jsonl")
 
@@ -1061,8 +1061,8 @@ def main():
     print(" point cloud from : ", canny_features_vtk) 
     print(" features point clouds to : ", canny_features_vtm) 
     print(" features finger prints to : ", fingerprints_jsonl) 
-    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
-    #                                   features_out_vtk=canny_features_vtm)
+    fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
+                                       features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
