@@ -17,6 +17,9 @@ else:
 
 import geovista as gv
 import pyvista as pv
+import matplotlib.pyplot as plt
+import vtk
+import json
 from pyvista.trame.jupyter import launch_server
 
 import time
@@ -193,7 +196,6 @@ def _stack_metrics(fps: list[dict], keys: list[str]) -> np.ndarray:
 
 def load_fingerprints_json(path: str) -> list[dict]:
     """Load fingerprints from a JSON or JSONL file."""
-    import json
     fps = []
     with open(path, "r", encoding="utf-8") as fh:
         head = fh.read(1)
@@ -217,7 +219,6 @@ def plot_features_from_json(path: str,
                             title: str = "Embedded features",
                             show: bool = False):
     """Load JSON/JSONL fingerprints and plot embedded features."""
-    import matplotlib.pyplot as plt
     try:
         from .cluster import embed_features
     except Exception:
@@ -265,7 +266,6 @@ def plot_features_from_json(path: str,
 def load_point_clouds_vtm(path: str) -> list[np.ndarray]:
     """Load point clouds from a .vtm MultiBlock file."""
     try:
-        import pyvista as pv
         data = pv.read(path)
         clouds = []
         if isinstance(data, pv.MultiBlock):
@@ -281,7 +281,6 @@ def load_point_clouds_vtm(path: str) -> list[np.ndarray]:
 
 def load_point_clouds_json(path: str, key: str = "points") -> list[np.ndarray]:
     """Load point cloud(s) from JSON or JSONL."""
-    import json
     clouds = []
     with open(path, "r", encoding="utf-8") as fh:
         head = fh.read(1)
@@ -300,7 +299,6 @@ def load_point_clouds_json(path: str, key: str = "points") -> list[np.ndarray]:
 
 def save_fingerprints_json(fps: list[dict], path: str) -> None:
     """Save fingerprints to JSON or JSONL, preserving structure."""
-    import json
     is_jsonl = path.name.endswith(".jsonl")
     with open(path, "w", encoding="utf-8") as fh:
         if is_jsonl:
@@ -396,7 +394,6 @@ class IterativeHDBSCAN:
 
 def save_point_clouds_jsonl(path: str, clouds: list[np.ndarray]) -> None:
     """Save list of point clouds as JSONL (one cloud per line)."""
-    import json
     with open(path, "w", encoding="utf-8") as fh:
         for i, pts in enumerate(clouds):
             rec = {"feature_id": int(i), "points": np.asarray(pts, dtype=float).tolist()}
@@ -416,7 +413,6 @@ def save_point_clouds_vtk(prefix: str, clouds: list[np.ndarray]) -> None:
 
     try:
         print("save feature clouds as PolyData blocks as defined by cluster algorithm")
-        import pyvista as pv
         blocks = pv.MultiBlock()
         for i, pts in enumerate(clouds):
             pts = np.asarray(pts, dtype=float)
@@ -612,7 +608,6 @@ def load_point_clouds_vtk(path: str) -> list[np.ndarray]:
     """Load point cloud(s) from a .vtk file.
     return mpoints and mesh"""
     try:
-        import pyvista as pv
         data = pv.read(path)
 
         mesh = data.combine()
@@ -649,7 +644,6 @@ def load_point_clouds_vtk(path: str) -> list[np.ndarray]:
         return clouds
     except Exception:
         try:
-            import vtk
             reader = vtk.vtkGenericDataObjectReader()
             reader.SetFileName(path)
             reader.Update()
@@ -865,13 +859,19 @@ def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int
 
     geo = pose.get("geo")
     if geo:
-        return _from_local_tangent(X_local, geo)
+        X_geo = _from_local_tangent(X_local, geo)
+        lon = X_geo[:, 0]
+        lat = X_geo[:, 1]
+        depth = X_geo[:, 2]
+        mask = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(depth)
+        mask &= (lat > -89.0) & (lat < 89.0)
+        mask &= ~((np.abs(lon) < 1e-6) & (np.abs(lat) < 1e-6))
+        return X_geo[mask]
 
     return X_local
 
 def _ecef_to_lonlatalt(X: np.ndarray) -> np.ndarray:
     """Convert ECEF (meters) to lon/lat/alt (degrees, meters)."""
-    from pyproj import Transformer
     X = np.asarray(X, dtype=float)
     if X.size == 0:
         return X
@@ -899,14 +899,13 @@ def _downsample_points(X: np.ndarray, max_points: int | None, seed: int = 42) ->
     idx = rng.choice(X.shape[0], size=max_points, replace=False)
     return X[idx]
 
-def plot_compare_with_original(labels_json_path: str, 
+def plot_compare_with_original_gv(labels_json_path: str, 
                                original_points,
                                index: int = 0,
                                n_points: int = 512,
                                zlevel_scale: float = ZLEVEL_SCALE_CLOUD,
                                max_features: int | None = None,
                                max_points_per_cloud: int | None = 256,
-                               show_matplotlib: bool = False,
                                indices: int | None = None):
     
     """Load labeled fingerprints, reconstruct feature(s), and compare to original."""
@@ -941,73 +940,114 @@ def plot_compare_with_original(labels_json_path: str,
 
     print("ZLEVEL_SCALE_CLOUD= ", ZLEVEL_SCALE_CLOUD)
     print("zlevel_scale= ", zlevel_scale)
+    if sys.flags.interactive:
+        plotter = gv.GeoPlotter(off_screen=True)
+    else:
+        plotter = gv.GeoPlotter(off_screen=False)
+    
+    label_set = sorted({fp.get("type_label", fp.get("label", "unknown")) for fp in fps})
+    cmap = mpl.colormaps["tab10"].resampled(len(label_set))
+    color_map = {lab: cmap(i) for i, lab in enumerate(label_set)}
+
+    def _subtype_color(fp):
+        lab = fp.get("type_label", fp.get("label", "unknown"))
+        return color_map[lab]
+
+    selection = ["eddy", "swirl"]
+    selection = ["eddy", ]
+    for i in indices:
+        fp = fps[i]
+        X_orig = clouds[i]
+        len_X_orig = len(X_orig)
+        #_dbg("index, type_label, circularity, len(cloud) ",
+        #     i, fp.get("type_label"), fp["metrics"].get("circularity"), len_X_orig)
+        n_points=len_X_orig
+        max_points_per_cloud = min(len_X_orig, n_points)
+        #X_recon = reconstruct_points_from_fingerprint(fp, n_points=max_points_per_cloud )
+
+        X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
+        #_dbg("X_orig [:3] ", X_orig [:3])
+        #_dbg("X_recon [:3] ", X_recon [:3])
+        #_dbg("fp  ", fp)
+
+        X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
+        # create the point-cloud from the sample data
+        mesh_orig = pv.PolyData(X_orig)
+        #mesh_recon = pv.PolyData(X_recon)
+
+        #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
+
+        if fp.get("type_label") in selection:
+            plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
+            #plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
+
+    plotter.add_coastlines("110m", color="black")
+    html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
+    html_dir = pathlib.Path("/home/users/bernd.becker/public_html/FRONTAL/")
+    plotfile = html_dir / html_file
+    print(" make ", plotfile)
     try:
-        if sys.flags.interactive:
-            plotter = gv.GeoPlotter(off_screen=True)
-        else:
-            plotter = gv.GeoPlotter(off_screen=False)
-        
-        label_set = sorted({fp.get("type_label", fp.get("label", "unknown")) for fp in fps})
-        cmap = cm.get_cmap("tab10", len(label_set))
-        color_map = {lab: cmap(i) for i, lab in enumerate(label_set)}
-
-        def _subtype_color(fp):
-            lab = fp.get("type_label", fp.get("label", "unknown"))
-            return color_map[lab]
-
-        for i in indices:
-            fp = fps[i]
-            X_orig = clouds[i]
-            len_X_orig = len(X_orig)
-            #_dbg("index, type_label, circularity, len(cloud) ",
-            #     i, fp.get("type_label"), fp["metrics"].get("circularity"), len_X_orig)
-#           n_points=len_X_orig
-            max_points_per_cloud = min(len_X_orig, n_points)
-            X_recon = reconstruct_points_from_fingerprint(fp, n_points=max_points_per_cloud )
-
-            X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
-            #_dbg("X_orig [:3] ", X_orig [:3])
-            #_dbg("X_recon [:3] ", X_recon [:3])
-            #_dbg("fp  ", fp)
-
-#           X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
-            # create the point-cloud from the sample data
-            mesh_orig = pv.PolyData(X_orig)
-            mesh_recon = pv.PolyData(X_recon)
-
-            #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
-
-            #plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
-            plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
-
-        html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
-        html_dir = pathlib.Path("/home/users/bernd.becker/public_html/FRONTAL/")
-        plotfile = html_dir / html_file
-        print(" make ", plotfile)
-        try:
-            _progress("[fp] exporting html...")
-            plotter.export_html(plotfile)
-            _progress("[fp] export done  ...")
-        except Exception as e:
-            html_dir = pathlib.Path("/home/users/orca12/public_html/research/FRONTAL")
-            plotfile = html_dir / html_file
-            print(e, " \n save html to plotfile instead ", plotfile)
-            _progress("[fp] exporting html...")
-            plotter.export_html(plotfile)
-            _progress("[fp] export done  ...")
-
-        if sys.flags.interactive:
-  
-            print("plotter.show(return_cpos=True) despite running  batch")
-            #plotter.show(return_cpos=True)
-        else:
-            pass
-
+        _progress("[fp] exporting html...")
+        plotter.export_html(plotfile)
+        _progress("[fp] export done  ...")
     except Exception as e:
-        print("plot failed:", e)
+        html_dir = pathlib.Path("/home/users/orca12/public_html/research/FRONTAL")
+        plotfile = html_dir / html_file
+        print(e, " \n save html to plotfile instead ", plotfile)
+        _progress("[fp] exporting html...")
+        plotter.export_html(plotfile)
+        _progress("[fp] export done  ...")
 
+    if sys.flags.interactive:
+
+        print("plotter.show(return_cpos=True) despite running  batch")
+        #plotter.show(return_cpos=True)
+    else:
+        pass
+
+    return 
+
+def plot_compare_with_original_plt(labels_json_path: str, 
+                               original_points,
+                               index: int = 0,
+                               n_points: int = 512,
+                               max_features: int | None = None,
+                               max_points_per_cloud: int | None = 256,
+                               show_matplotlib: bool = False,
+                               mercator_2d: bool = False,
+                               indices: int | None = None):
+    
+    """Load labeled fingerprints, reconstruct feature(s), and compare to original."""
+    fps = load_fingerprints_json(labels_json_path)
+
+    _dbg("fps length", len(fps))
+    _dbg("fps[0].keys", fps[0].keys() if fps else None)
+    _dbg("fps[0][\"grid\"].keys() ", fps[0]["grid"].keys())
+
+    summarize_metrics(fps)
+
+    if not fps:
+        print(" no fingerprints!")
+        return None, None
+
+    clouds, mesh = load_point_clouds_vtm(original_points)
+    if not clouds:
+        print(" no clouds!")
+        return None, None
+
+    n_total = min(len(fps), len(clouds))
+    step = max(1, int(indices)) if indices is not None else 1
+
+    if max_features is None or max_features <= 0:
+        indices = list(range(0, n_total, step))
+    elif max_features == 1:
+        indices = [min(max(index, 0), n_total - 1)]
+    else:
+        n = min(n_total, max_features)
+        indices = list(range(0, n, step))
+
+    selection = ["eddy", ]
     if show_matplotlib:
-        import matplotlib.pyplot as plt
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
         for i in indices:
@@ -1034,8 +1074,48 @@ def plot_compare_with_original(labels_json_path: str,
             pass
         plt.close()
 
+    if mercator_2d:
 
-    return clouds[indices[0]], reconstruct_points_from_fingerprint(fps[indices[0]], n_points=n_points)
+        fig, ax = plt.subplots(figsize=(8, 5), subplot_kw={'projection': ccrs.Mercator()})
+
+
+        ax.set_global()
+        ax.coastlines(linewidth=0.5)
+        ax.set_extent([-179, 179, -85, 85], crs=ccrs.PlateCarree())
+
+        for i in indices:
+            fp = fps[i]
+
+            if fp.get("type_label") in selection:
+                X_orig = clouds[i]
+                len_X_orig = len(X_orig)
+                _dbg("index, type_label, circularity, pose, len(cloud) ",
+                     i, fp.get("type_label"), fp["metrics"].get("circularity"), 
+                     fp.get["pose"], len_X_orig)
+#                    fp["pose"].get("geo"), len_X_orig)
+
+                if len_X_orig > n_points:
+                    X_orig = _downsample_points(clouds[i], n_points, seed=42)
+                    #X_recon = _downsample_points(reconstruct_points_from_fingerprint(fp, n_points=n_points),
+                    #                             max_points_per_cloud, seed=42)
+                sc1 = ax.scatter(
+                    X_orig[:, 0], X_orig[:, 1],
+                    c=-X_orig[:, 2], s=3, cmap="viridis",
+                    transform=ccrs.PlateCarree(), alpha=0.6
+                                )
+            #sc2 = ax.scatter(
+            #    X_recon[:, 0], X_recon[:, 1],
+            #    c=-X_recon[:, 2], s=3, cmap="plasma",
+            #    transform=ccrs.PlateCarree(), alpha=0.6
+            #)
+        plt.colorbar(sc1, ax=ax, label="Depth (m)")    
+        merc_file = pathlib.Path(pathlib.Path(labels_json_path).stem + "_mercator").with_suffix(".png")
+        merc_dir = pathlib.Path(labels_json_path).parent
+        _dbg(merc_dir / merc_file)
+        plt.savefig(merc_dir / merc_file, dpi=150, bbox_inches="tight")
+        plt.close()
+
+    return 
 
 def main():
     """Plot embeddings for synthetic features and clustered outputs."""
@@ -1061,17 +1141,19 @@ def main():
     print(" point cloud from : ", canny_features_vtk) 
     print(" features point clouds to : ", canny_features_vtm) 
     print(" features finger prints to : ", fingerprints_jsonl) 
-    fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
-                                       features_out_vtk=canny_features_vtm)
+    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
+    #                                   features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
     # for index in range(0,31):
     print("plot_compare_with_original :", fingerprints_jsonl, " with \n", canny_features_vtm)
 
-    plot_compare_with_original(fingerprints_jsonl, canny_features_vtm, \
-                               indices=1, show_matplotlib=True)
-    plot_features_from_json(fingerprints_jsonl, show=False)
+#   plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
+#                              indices=1)
+    plot_compare_with_original_plt(fingerprints_jsonl, canny_features_vtm, \
+                               indices=70, show_matplotlib=False, mercator_2d=True)
+#   plot_features_from_json(fingerprints_jsonl, show=False)
 #   b=34
 #   a = b/0
     return

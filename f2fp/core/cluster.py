@@ -1,16 +1,20 @@
 from __future__ import annotations
 import numpy as np
 
-def embed_features(M: np.ndarray, n_components=2, random_state=42) -> np.ndarray:
+def embed_features(M: np.ndarray, n_components=2, random_state: int | None = None) -> np.ndarray:
     """Embed features using UMAP or PCA as fallback."""
     assert M.shape[0] > 0, "Input matrix M is empty"
     try:
         import umap
-        # UMAP embedding
-        reducer = umap.UMAP(n_components=n_components, random_state=random_state)
+        reducer = umap.UMAP(
+            n_components=n_components,
+            random_state=random_state,
+            n_neighbors=30,
+            min_dist=0.1,
+            n_jobs=-1 if random_state is None else 1
+        )
         return reducer.fit_transform(M)
     except Exception:
-        # Fallback to PCA
         from sklearn.decomposition import PCA
         n_samples, n_features = M.shape
         n_comp = max(1, min(int(n_components), n_samples, n_features))
@@ -54,24 +58,7 @@ def cluster_labels(M: np.ndarray, min_cluster_size=20, random_state=42, force_n_
             return KMeans(n_clusters=force_n_clusters, random_state=random_state).fit_predict(M)
 
     return labels
-# ...existing code...
-def load_clouds_vtm(path: str) -> list[np.ndarray]:
-    """Load point clouds from a .vtm MultiBlock file."""
-    try:
-        import pyvista as pv
-        data = pv.read(path)
-        clouds = []
-        if isinstance(data, pv.MultiBlock):
-            for block in data:
-                if block is None:
-                    continue
-                pts = np.asarray(block.points, dtype=float) if hasattr(block, "points") else None
-                if pts is not None and pts.size:
-                    clouds.append(pts)
-        return clouds
-    except Exception:
-        return []
-# ...existing code...
+
 def cluster_labels_hdbscan_optimized(M: np.ndarray,
                                     min_cluster_size=20,
                                     random_state=42,
