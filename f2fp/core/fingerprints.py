@@ -697,11 +697,28 @@ def run_pipeline_from_vtk(vtk_path: str,
 
     return fps_dicts
 
+def _ecef_to_lonlat_depth(X_ecef: np.ndarray):
+    """ECEF (meters) -> lon/lat (deg), depth (m, +down)."""
+    X = np.asarray(X_ecef, dtype=float).reshape(-1, 3)
+    crs_ecef = CRS.from_epsg(4978)   # WGS84 geocentric
+    crs_geo = CRS.from_epsg(4979)    # WGS84 geodetic 3D
+    tf = Transformer.from_crs(crs_ecef, crs_geo, always_xy=True)
+    lon, lat, h = tf.transform(X[:, 0], X[:, 1], X[:, 2])  # h = height (m, +up)
+    depth = -h
+    out = np.column_stack([lon, lat, depth])
+    return out[0] if X_ecef.ndim == 1 else out
+
 def _to_local_tangent(lon_lat_depth: np.ndarray, depth_positive_down: bool = True):
     """lon/lat/depth(m) -> local x/y/z(m) in azimuthal equidistant CRS (pyproj)."""
     lon = lon_lat_depth[:, 0]
     lat = lon_lat_depth[:, 1]
     depth = lon_lat_depth[:, 2]
+
+    # auto-detect radians
+    if np.nanmax(np.abs(lon)) <= 2 * np.pi and np.nanmax(np.abs(lat)) <= np.pi:
+        lon = np.rad2deg(lon)
+        lat = np.rad2deg(lat)
+
     lon0 = float(np.mean(lon))
     lat0 = float(np.mean(lat))
 
@@ -720,6 +737,10 @@ def _from_local_tangent(X_local: np.ndarray, geo: dict):
     lat0 = float(geo["lat0"])
     depth_positive_down = bool(geo.get("depth_positive_down", True))
 
+    X_local = np.asarray(X_local, dtype=float)
+    single = (X_local.ndim == 1)
+    X_local = X_local.reshape(-1, 3)
+    
     crs_geo = CRS.from_epsg(4326)
     crs_loc = CRS.from_proj4(f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} +units=m +datum=WGS84 +type=crs")
     inv = Transformer.from_crs(crs_loc, crs_geo, always_xy=True)
@@ -1007,6 +1028,92 @@ def plot_compare_with_original_gv(labels_json_path: str,
 
     return 
 
+def plot_from_fp_plt(labels_json_path: str, 
+                     original_points,
+                     index: int = 0,
+                     n_points: int = 128,
+                     max_features: int | None = None,
+                     max_points_per_cloud: int | None = 256,
+                     show_matplotlib: bool = False,
+                     mercator_2d: bool = False,
+                     indices: int | None = None):
+
+    """Load labeled fingerprints, reconstruct feature(s), and compare to original."""
+    fps = load_fingerprints_json(labels_json_path)
+
+    selection = ["eddy", ]
+    for i, fp in enumerate(fps):
+
+        if fp.get("type_label") in selection:
+            X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
+
+            _dbg("index, type_label, circularity, pose, len(cloud) ",
+                 i, fp.get("type_label"), fp["metrics"].get("circularity"),
+                 fp.get("pose"), n_points)
+
+    # ---- 2) Cartesian -> lon/lat ----
+    # If your XYZ are already on a unit sphere (as GeoVista commonly uses), this is perfect.
+    # If they are ECEF in meters, geo conversion still works (it normalizes to the sphere).
+            geo = fp.get("pose", {}).get("geo")
+            if not geo:
+                continue  # no geo -> cannot convert to lon/lat
+
+            X_ll =  _ecef_to_lonlat_depth(X_recon)
+            lon_deg = X_ll [:, 0]
+            lat_deg = X_ll [:, 1]
+            depth = X_ll [:, 2]
+            _dbg("lalo ", min(lon_deg), max(lon_deg), min(lat_deg), max(lat_deg))
+
+    # Optional: if you have a depth or scalar to color by
+
+    # ---- 3) Plot on Mercator map ----
+            fig, ax = plt.subplots(figsize=(8, 5), subplot_kw={'projection': ccrs.Mercator()})
+            ax.coastlines(linewidth=0.8)
+
+            kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=10, edgecolor='k', linewidths=0.2)
+            if depth is not None:
+                sc = ax.scatter(lon_deg, lat_deg, c=depth, cmap='viridis', **kwargs)
+                cb = plt.colorbar(sc, ax=ax, orientation='horizontal', pad=0.03)
+                cb.set_label('Depth (m, +down)')
+            else:
+                ax.scatter(lon_deg, lat_deg, color='crimson', **kwargs)
+
+            pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(X_recon)
+            radius = radius * ZLEVEL_SCALE_CLOUD
+            _dbg("index, pos_x, pos_y, radius ",  i, pos_x, pos_y, pos_z, radius) 
+            one_point = np.column_stack((pos_x, pos_y, pos_z))
+            one_point =  _from_local_tangent(one_point, geo)
+            _dbg(one_point, one_point.shape)
+            pos_x, pos_y, depth =  one_point[0,0],one_point[0,1],one_point[0,2]
+            lon = np.rad2deg(pos_x)
+            lat = np.rad2deg(pos_y)
+            _dbg("index, pos_x, pos_y, depth ",  i, lon, lat, radius) 
+
+    # Basic extent (auto fit)
+    def mercator_safe_extent(lon, lat, pad_lon=2.0, pad_lat=1.0):
+        lon = np.asarray(lon); lat = np.clip(np.asarray(lat), -85, 85)
+        lon_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(lon)))
+        lon_min, lon_max = lon_unwrapped.min(), lon_unwrapped.max()
+        center = ((0.5 * (lon_min + lon_max) + 180) % 360) - 180
+        width = min((lon_max - lon_min) + 2 * pad_lon, 359.0)
+        lon1, lon2 = center - width/2, center + width/2
+        lat1, lat2 = max(-85, lat.min() - pad_lat), min(85, lat.max() + pad_lat)
+        eps = 1e-3
+        return [max(-180+eps, lon1), min(180-eps, lon2), lat1, lat2]
+
+    ax.set_extent(mercator_safe_extent(lon_deg, lat_deg), crs=ccrs.PlateCarree())
+
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='0.8', linestyle=':')
+    gl.top_labels = gl.right_labels = False
+
+    plt.title('VTK Cartesian Points on Mercator (via lon/lat conversion)')
+    plt.tight_layout()
+  
+    merc_file = pathlib.Path(pathlib.Path(labels_json_path).stem + "_mercator").with_suffix(".png")
+    merc_dir = pathlib.Path(labels_json_path).parent
+    _dbg(merc_dir / merc_file)
+    plt.savefig(merc_dir / merc_file, dpi=150, bbox_inches="tight")
+
 def plot_compare_with_original_plt(labels_json_path: str, 
                                original_points,
                                index: int = 0,
@@ -1091,7 +1198,7 @@ def plot_compare_with_original_plt(labels_json_path: str,
                 len_X_orig = len(X_orig)
                 _dbg("index, type_label, circularity, pose, len(cloud) ",
                      i, fp.get("type_label"), fp["metrics"].get("circularity"), 
-                     fp.get["pose"], len_X_orig)
+                     fp.get("pose"), len_X_orig)
 #                    fp["pose"].get("geo"), len_X_orig)
 
                 if len_X_orig > n_points:
@@ -1116,6 +1223,26 @@ def plot_compare_with_original_plt(labels_json_path: str,
         plt.close()
 
     return 
+
+def estimate_eddy_geometry(X_local: np.ndarray) -> dict:
+    """
+    Approximate eddy center (x,y,z), depth, and radius from local-tangent meters.
+    Returns center (x,y), depth (m, +down), radius (m).
+    """
+    X = np.asarray(X_local, dtype=float)
+    if X.ndim != 2 or X.shape[1] != 3 or X.size == 0:
+        return {"center_xy": [0.0, 0.0], "depth": 0.0, "radius": 0.0}
+
+    # center (robust)
+    cx, cy, cz = np.median(X, axis=0)
+
+    # radius from horizontal distances
+    r = np.sqrt((X[:, 0] - cx) ** 2 + (X[:, 1] - cy) ** 2)
+    radius = float(np.median(r))
+
+#   return {"center_xy": [float(cx), float(cy)], "depth": float(cz), "radius": radius}
+    return float(cx), float(cy), float(cz),  radius
+
 
 def main():
     """Plot embeddings for synthetic features and clustered outputs."""
@@ -1151,8 +1278,8 @@ def main():
 
 #   plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
 #                              indices=1)
-    plot_compare_with_original_plt(fingerprints_jsonl, canny_features_vtm, \
-                               indices=70, show_matplotlib=False, mercator_2d=True)
+    plot_from_fp_plt(fingerprints_jsonl, canny_features_vtm, \
+                      indices=70, show_matplotlib=False, mercator_2d=True)
 #   plot_features_from_json(fingerprints_jsonl, show=False)
 #   b=34
 #   a = b/0
