@@ -27,12 +27,15 @@ from contextlib import contextmanager
 import numpy as np
 import pathlib
 import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
 from pyproj import CRS, Transformer
 from collections import Counter
 import matplotlib.cm as cm
 
 #from geovista.pantry.meshes import ZLEVEL_SCALE_CLOUD  # == 0.00001 ,1.e-5
-ZLEVEL_SCALE_CLOUD=1./6371000.  # NOT! == 0.00001 ,1.e-5
+R_EARTH_M = 6_371_000.0
+ZLEVEL_SCALE_CLOUD=1./R_EARTH_M   # NOT! == 0.00001 ,1.e-5
 
 
 from fast_hdbscan import HDBSCAN as FastHDBSCAN
@@ -705,8 +708,10 @@ def _ecef_to_lonlat_depth(X_ecef: np.ndarray):
     tf = Transformer.from_crs(crs_ecef, crs_geo, always_xy=True)
     lon, lat, h = tf.transform(X[:, 0], X[:, 1], X[:, 2])  # h = height (m, +up)
     depth = -h
-    out = np.column_stack([lon, lat, depth])
-    return out[0] if X_ecef.ndim == 1 else out
+    lon = ((lon + 180.0) % 360.0) - 180.0
+#   out = np.column_stack([lon, lat, depth])
+#   return out[0] if X_ecef.ndim == 1 else out
+    return lon, lat, h
 
 def _to_local_tangent(lon_lat_depth: np.ndarray, depth_positive_down: bool = True):
     """lon/lat/depth(m) -> local x/y/z(m) in azimuthal equidistant CRS (pyproj)."""
@@ -1028,6 +1033,31 @@ def plot_compare_with_original_gv(labels_json_path: str,
 
     return 
 
+def depth_km_from(ds, h_m):
+    for k in ds.point_data.keys():
+        if k.lower() == "depth":
+            d = np.asarray(ds.point_data[k], dtype=float).ravel()
+            return d  # assumed km; change if your depth is in meters
+    return np.asarray(h_m)/1000.0
+
+def as_points_xyz_lonlatdepth(lon_deg, lat_deg, depth_km):
+    """
+    Stack lon, lat, depth_km into a single (N,3) float64 array:
+    columns = [lon_deg, lat_deg, depth_km].
+    """
+    lon = np.asarray(lon_deg, dtype=np.float64).ravel()
+    lat = np.asarray(lat_deg, dtype=np.float64).ravel()
+    dep = np.asarray(depth_km, dtype=np.float64).ravel()
+    if not (lon.shape == lat.shape == dep.shape):
+        raise ValueError(f"Shapes must match: lon={lon.shape}, lat={lat.shape}, depth={dep.shape}")
+    return np.stack([lon, lat, dep], axis=1)  # (N,3)
+
+def scale_to_m(points):
+    r = float(np.median(np.linalg.norm(points, axis=1)))
+    if r < 2.0:    return points * R_EARTH_M   # unit sphere
+    if r > 1e6:    return points               # meters
+    return points * 1000.0          
+
 def plot_from_fp_plt(labels_json_path: str, 
                      original_points,
                      index: int = 0,
@@ -1041,15 +1071,17 @@ def plot_from_fp_plt(labels_json_path: str,
     """Load labeled fingerprints, reconstruct feature(s), and compare to original."""
     fps = load_fingerprints_json(labels_json_path)
 
+    lon_all, lat_all, dep_all, cid_all = [], [], [], []
+    cid = 0
     selection = ["eddy", ]
     for i, fp in enumerate(fps):
 
         if fp.get("type_label") in selection:
             X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
 
-            _dbg("index, type_label, circularity, pose, len(cloud) ",
-                 i, fp.get("type_label"), fp["metrics"].get("circularity"),
-                 fp.get("pose"), n_points)
+            #_dbg("index, type_label, circularity, pose, len(cloud) ",
+            #     i, fp.get("type_label"), fp["metrics"].get("circularity"),
+            #     fp.get("pose"), n_points)
 
     # ---- 2) Cartesian -> lon/lat ----
     # If your XYZ are already on a unit sphere (as GeoVista commonly uses), this is perfect.
@@ -1058,50 +1090,58 @@ def plot_from_fp_plt(labels_json_path: str,
             if not geo:
                 continue  # no geo -> cannot convert to lon/lat
 
-            X_ll =  _ecef_to_lonlat_depth(X_recon)
-            lon_deg = X_ll [:, 0]
-            lat_deg = X_ll [:, 1]
-            depth = X_ll [:, 2]
-            _dbg("lalo ", min(lon_deg), max(lon_deg), min(lat_deg), max(lat_deg))
+            pts = np.asarray(X_recon, dtype=float)
+            pts_m = scale_to_m(pts)
+
+            lon, lat, dep =  _ecef_to_lonlat_depth(pts_m)
+            #dep = depth_km_from(X_recon, h_m)
+            lon_all.append(lon); lat_all.append(lat); dep_all.append(dep); cid_all.append(np.full(lon.shape, cid, int))
+            cid += 1
+
+            points_m = as_points_xyz_lonlatdepth(lon, lat, dep)
+
+            pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(points_m)
+            #_dbg("index, pos_x, pos_y, radius ",  i, pos_x, pos_y, pos_z, radius) 
+            one_point = np.column_stack((pos_x, pos_y, pos_z))
+            one_point =  _from_local_tangent(one_point, geo)
+            #_dbg(one_point, one_point.shape)
+            pos_x, pos_y, depth =  one_point[0,0],one_point[0,1],one_point[0,2]
+            depth = depth * R_EARTH_M
+            lon = np.rad2deg(pos_x)
+            lat = np.rad2deg(pos_y)
+            _dbg("index, pos_x, pos_y, radius ",  i, lon, lat, radius) 
+
+    if cid == 0: raise RuntimeError("No point-bearing blocks found.")
+
+    lon_deg = lon_all    
+    lat_deg = lat_all    
+    depth = dep_all    
+    #_dbg("lalo ", min(lon_deg), max(lon_deg), min(lat_deg), max(lat_deg))
 
     # Optional: if you have a depth or scalar to color by
 
-    # ---- 3) Plot on Mercator map ----
-            fig, ax = plt.subplots(figsize=(8, 5), subplot_kw={'projection': ccrs.Mercator()})
-            ax.coastlines(linewidth=0.8)
+    # ---- 3) Plot on lat lon map ----
+    fig = plt.subplots(figsize=(8, 5))
+    central_longitude = 180.
+    ax = plt.axes(projection=ccrs.PlateCarree(central_longitude=central_longitude))
+    # Apply extent (in geographic coords)
+    extent = [-180,180,-80,80]
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-            kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=10, edgecolor='k', linewidths=0.2)
-            if depth is not None:
-                sc = ax.scatter(lon_deg, lat_deg, c=depth, cmap='viridis', **kwargs)
-                cb = plt.colorbar(sc, ax=ax, orientation='horizontal', pad=0.03)
-                cb.set_label('Depth (m, +down)')
-            else:
-                ax.scatter(lon_deg, lat_deg, color='crimson', **kwargs)
+    # Add simple map features
+    ax.coastlines(resolution="110m", linewidth=0.7)
+    ax.add_feature(cfeature.LAND, edgecolor="none", facecolor="0.95")
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5)
 
-            pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(X_recon)
-            radius = radius * ZLEVEL_SCALE_CLOUD
-            _dbg("index, pos_x, pos_y, radius ",  i, pos_x, pos_y, pos_z, radius) 
-            one_point = np.column_stack((pos_x, pos_y, pos_z))
-            one_point =  _from_local_tangent(one_point, geo)
-            _dbg(one_point, one_point.shape)
-            pos_x, pos_y, depth =  one_point[0,0],one_point[0,1],one_point[0,2]
-            lon = np.rad2deg(pos_x)
-            lat = np.rad2deg(pos_y)
-            _dbg("index, pos_x, pos_y, depth ",  i, lon, lat, radius) 
 
-    # Basic extent (auto fit)
-    def mercator_safe_extent(lon, lat, pad_lon=2.0, pad_lat=1.0):
-        lon = np.asarray(lon); lat = np.clip(np.asarray(lat), -85, 85)
-        lon_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(lon)))
-        lon_min, lon_max = lon_unwrapped.min(), lon_unwrapped.max()
-        center = ((0.5 * (lon_min + lon_max) + 180) % 360) - 180
-        width = min((lon_max - lon_min) + 2 * pad_lon, 359.0)
-        lon1, lon2 = center - width/2, center + width/2
-        lat1, lat2 = max(-85, lat.min() - pad_lat), min(85, lat.max() + pad_lat)
-        eps = 1e-3
-        return [max(-180+eps, lon1), min(180-eps, lon2), lat1, lat2]
+    kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=0.30, edgecolor='k', linewidths=0.2)
+    if depth is not None:
+        sc = ax.scatter(lon_deg, lat_deg, c=depth, cmap='viridis', **kwargs)
+        cb = plt.colorbar(sc, ax=ax, orientation='horizontal', pad=0.03)
+        cb.set_label('Depth (m, +down)')
+    else:
+        ax.scatter(lon_deg, lat_deg, color='crimson', **kwargs)
 
-    ax.set_extent(mercator_safe_extent(lon_deg, lat_deg), crs=ccrs.PlateCarree())
 
     gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='0.8', linestyle=':')
     gl.top_labels = gl.right_labels = False
@@ -1207,8 +1247,9 @@ def plot_compare_with_original_plt(labels_json_path: str,
                     #                             max_points_per_cloud, seed=42)
                 sc1 = ax.scatter(
                     X_orig[:, 0], X_orig[:, 1],
-                    c=-X_orig[:, 2], s=3, cmap="viridis",
-                    transform=ccrs.PlateCarree(), alpha=0.6
+                    c=-X_orig[:, 2], s=0.3, cmap="viridis",
+                    transform=ccrs.PlateCarree(), alpha=0.6, 
+                    edgecolors='none', linewidths=0
                                 )
             #sc2 = ax.scatter(
             #    X_recon[:, 0], X_recon[:, 1],
