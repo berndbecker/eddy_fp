@@ -989,7 +989,7 @@ def plot_compare_with_original_gv(labels_json_path: str,
         #     i, fp.get("type_label"), fp["metrics"].get("circularity"), len_X_orig)
         n_points=len_X_orig
         max_points_per_cloud = min(len_X_orig, n_points)
-        #X_recon = reconstruct_points_from_fingerprint(fp, n_points=max_points_per_cloud )
+        X_recon = reconstruct_points_from_fingerprint(fp, n_points=max_points_per_cloud )
 
         X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
         #_dbg("X_orig [:3] ", X_orig [:3])
@@ -999,13 +999,13 @@ def plot_compare_with_original_gv(labels_json_path: str,
         X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
         # create the point-cloud from the sample data
         mesh_orig = pv.PolyData(X_orig)
-        #mesh_recon = pv.PolyData(X_recon)
+        mesh_recon = pv.PolyData(X_recon)
 
         #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
 
         if fp.get("type_label") in selection:
             plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
-            #plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
+            plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
 
     plotter.add_coastlines("110m", color="black")
     html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
@@ -1100,13 +1100,14 @@ def plot_from_fp_plt(labels_json_path: str,
 
             points_m = as_points_xyz_lonlatdepth(lon, lat, dep)
 
+
             pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(points_m)
             #_dbg("index, pos_x, pos_y, radius ",  i, pos_x, pos_y, pos_z, radius) 
             one_point = np.column_stack((pos_x, pos_y, pos_z))
             one_point =  _from_local_tangent(one_point, geo)
             #_dbg(one_point, one_point.shape)
             pos_x, pos_y, depth =  one_point[0,0],one_point[0,1],one_point[0,2]
-            depth = depth * R_EARTH_M
+            depth = radius * R_EARTH_M
             lon = np.rad2deg(pos_x)
             lat = np.rad2deg(pos_y)
             _dbg("index, pos_x, pos_y, radius ",  i, lon, lat, radius) 
@@ -1115,7 +1116,8 @@ def plot_from_fp_plt(labels_json_path: str,
 
     lon_deg = lon_all    
     lat_deg = lat_all    
-    depth = dep_all    
+    dep_all = np.asarray(dep_all, dtype=float)
+    depth = dep_all    * float(R_EARTH_M)
     #_dbg("lalo ", min(lon_deg), max(lon_deg), min(lat_deg), max(lat_deg))
 
     # Optional: if you have a depth or scalar to color by
@@ -1132,9 +1134,14 @@ def plot_from_fp_plt(labels_json_path: str,
     ax.coastlines(resolution="110m", linewidth=0.7)
     ax.add_feature(cfeature.LAND, edgecolor="none", facecolor="0.95")
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5)
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.bottom_labels = True
+    gl.left_labels = False
 
 
-    kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=0.30, edgecolor='k', linewidths=0.2)
+    kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=0.30,
+                  edgecolors='none', linewidths=0)
     if depth is not None:
         sc = ax.scatter(lon_deg, lat_deg, c=depth, cmap='viridis', **kwargs)
         cb = plt.colorbar(sc, ax=ax, orientation='horizontal', pad=0.03)
@@ -1143,13 +1150,10 @@ def plot_from_fp_plt(labels_json_path: str,
         ax.scatter(lon_deg, lat_deg, color='crimson', **kwargs)
 
 
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='0.8', linestyle=':')
-    gl.top_labels = gl.right_labels = False
-
     plt.title('VTK Cartesian Points on Mercator (via lon/lat conversion)')
     plt.tight_layout()
   
-    merc_file = pathlib.Path(pathlib.Path(labels_json_path).stem + "_mercator").with_suffix(".png")
+    merc_file = pathlib.Path(pathlib.Path(labels_json_path).stem + "_plate").with_suffix(".png")
     merc_dir = pathlib.Path(labels_json_path).parent
     _dbg(merc_dir / merc_file)
     plt.savefig(merc_dir / merc_file, dpi=150, bbox_inches="tight")
@@ -1299,8 +1303,8 @@ def main():
     indir = "/data/scratch/orca12/BBecker_frontal_assessment/output/"
     filetag = "level1_gl_orca12_asm12_20260220_20260222T12/"
 
-    canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
-    #canny_features_vtk = pathlib.Path(indir + filetag + "CSV/NW_atlantic_salinity_on_salinity_fronts.vtk")
+    #canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
+    canny_features_vtk = pathlib.Path(indir + filetag + "CSV/NW_atlantic_salinity_on_salinity_fronts.vtk")
     #canny_features_vtk = pathlib.Path("synthetic_feature_point_cloud.vtk")
     canny_features_vtm = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".vtm")
     fingerprints_jsonl = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".jsonl")
@@ -1317,11 +1321,11 @@ def main():
     # for index in range(0,31):
     print("plot_compare_with_original :", fingerprints_jsonl, " with \n", canny_features_vtm)
 
-#   plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
-#                              indices=1)
+    plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
+                               indices=1)
     plot_from_fp_plt(fingerprints_jsonl, canny_features_vtm, \
-                      indices=70, show_matplotlib=False, mercator_2d=True)
-#   plot_features_from_json(fingerprints_jsonl, show=False)
+                      indices=7, show_matplotlib=False, mercator_2d=True)
+    plot_features_from_json(fingerprints_jsonl, show=False)
 #   b=34
 #   a = b/0
     return
