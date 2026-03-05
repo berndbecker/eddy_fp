@@ -38,7 +38,7 @@ R_EARTH_M = 6_371_000.0
 ZLEVEL_SCALE_CLOUD=1./R_EARTH_M   # NOT! == 0.00001 ,1.e-5
 
 
-from fast_hdbscan import HDBSCAN as FastHDBSCAN
+#from fast_hdbscan import HDBSCAN as FastHDBSCAN
 from dataclasses import dataclass
 try:
     from .canonical import pca_align,  Pose
@@ -114,12 +114,49 @@ def _coerce_point_cloud(feat) -> np.ndarray:
     return np.asarray(X, dtype=float)
 
 def build_fingerprint(X: np.ndarray, label: str | None = None) -> Fingerprint:
+    """ keys in fingerprint:
+    pose
+      centroid
+      R
+      scale_s
+      geo
+        crs
+        lon0
+        lat0
+        depth_positive_down
+    grid
+      nx
+      ny
+      nz
+      nnz
+      payload
+      center
+      half
+    metrics
+      linearity
+      planarity
+      scattering
+      circularity
+      nnz
+    label
+    moments
+      mean
+      variance
+      skewness
+      kurtosis
+    offset
+    scale
+    type_label
+    """
     X = _coerce_point_cloud(X)
     assert X.ndim == 2 and X.shape[1] == 3, "Input X must be (N,3) array"
     assert X.shape[0] > 0, "Input X must not be empty"
     Xc, pose = pca_align(X)
     grid = sparse_grid_12(Xc)
     metrics = _basic_metrics(Xc, grid)
+    # we need an index here for the process running number sequence.
+    #use enumerate when you loop the fingerprints, But this fails when you filter?"
+    # JSONL records need a dict with explicit id key
     return Fingerprint(pose=pose, grid=grid, metrics=metrics, label=label)
 
 def _normalize_metrics(metrics: dict) -> dict:
@@ -217,7 +254,7 @@ def load_metrics_matrix(path: str, keys: list[str]) -> np.ndarray:
     fps = load_fingerprints_json(path)
     return _stack_metrics(fps, keys)
 
-def plot_features_from_json(path: str,
+def plot_features(ctivatepath: str,
                             keys: list[str] | None = None,
                             title: str = "Embedded features",
                             show: bool = False):
@@ -1037,8 +1074,11 @@ def depth_km_from(ds, h_m):
     for k in ds.point_data.keys():
         if k.lower() == "depth":
             d = np.asarray(ds.point_data[k], dtype=float).ravel()
+            _dbg("depth in keys ", d)
             return d  # assumed km; change if your depth is in meters
-    return np.asarray(h_m)/1000.0
+    d = np.asarray(h_m)/1000.0
+    _dbg("depth not in keys  d= h_m/1000. ", d)
+    return d 
 
 def as_points_xyz_lonlatdepth(lon_deg, lat_deg, depth_km):
     """
@@ -1053,10 +1093,29 @@ def as_points_xyz_lonlatdepth(lon_deg, lat_deg, depth_km):
     return np.stack([lon, lat, dep], axis=1)  # (N,3)
 
 def scale_to_m(points):
+    """ dodgy scaler 
+    ∥[x,y,z]∥=sqr(x^2+y^2+z^2)
+    """
+
     r = float(np.median(np.linalg.norm(points, axis=1)))
     if r < 2.0:    return points * R_EARTH_M   # unit sphere
     if r > 1e6:    return points               # meters
     return points * 1000.0          
+
+def print_keys(d, indent=0):
+    if not isinstance(d, dict):
+        return
+    for k, v in d.items():
+        print("  " * indent + str(k))
+        if isinstance(v, dict):
+            print_keys(v, indent + 1)
+        elif isinstance(v, list):
+            # If list contains dicts, traverse them too
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    print("  " * (indent + 1) + f"[{i}]")
+                    print_keys(item, indent + 2)
+
 
 def plot_from_fp_plt(labels_json_path: str, 
                      original_points,
@@ -1070,22 +1129,32 @@ def plot_from_fp_plt(labels_json_path: str,
 
     """Load labeled fingerprints, reconstruct feature(s), and compare to original."""
     fps = load_fingerprints_json(labels_json_path)
+    clouds, mesh = load_point_clouds_vtm(original_points)
+    if not clouds:
+        print(" no clouds!")
+        return None, None
+
 
     lon_all, lat_all, dep_all, cid_all = [], [], [], []
     cid = 0
+
+    # only plot eddies
     selection = ["eddy", ]
     for i, fp in enumerate(fps):
 
-        if fp.get("type_label") in selection:
+        #print_keys(fp)
+
+        if fp.get("type_label") in selection:  # filter out whay is in selections, eddies only.
             X_recon = reconstruct_points_from_fingerprint(fp, n_points=n_points)
+#           X_recon = clouds[i]
 
             #_dbg("index, type_label, circularity, pose, len(cloud) ",
             #     i, fp.get("type_label"), fp["metrics"].get("circularity"),
             #     fp.get("pose"), n_points)
 
-    # ---- 2) Cartesian -> lon/lat ----
-    # If your XYZ are already on a unit sphere (as GeoVista commonly uses), this is perfect.
-    # If they are ECEF in meters, geo conversion still works (it normalizes to the sphere).
+            # ---- 2) Cartesian -> lon/lat ----
+            # If your XYZ are already on a unit sphere (as GeoVista commonly uses), this is perfect.
+            # If they are ECEF in meters, geo conversion still works (it normalizes to the sphere).
             geo = fp.get("pose", {}).get("geo")
             if not geo:
                 continue  # no geo -> cannot convert to lon/lat
@@ -1094,23 +1163,26 @@ def plot_from_fp_plt(labels_json_path: str,
             pts_m = scale_to_m(pts)
 
             lon, lat, dep =  _ecef_to_lonlat_depth(pts_m)
-            #dep = depth_km_from(X_recon, h_m)
+            #dep = depth_km_from(X_recon, dep)
             lon_all.append(lon); lat_all.append(lat); dep_all.append(dep); cid_all.append(np.full(lon.shape, cid, int))
             cid += 1
 
-            points_m = as_points_xyz_lonlatdepth(lon, lat, dep)
+            points_m = as_points_xyz_lonlatdepth(lon, lat, dep) # turn into points(N,3)
 
 
-            pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(points_m)
+            pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(X_recon )
+            radius = radius * R_EARTH_M
             #_dbg("index, pos_x, pos_y, radius ",  i, pos_x, pos_y, pos_z, radius) 
             one_point = np.column_stack((pos_x, pos_y, pos_z))
             one_point =  _from_local_tangent(one_point, geo)
-            #_dbg(one_point, one_point.shape)
+            #_dbg("one_point ", one_point, one_point.shape)
             pos_x, pos_y, depth =  one_point[0,0],one_point[0,1],one_point[0,2]
-            depth = radius * R_EARTH_M
             lon = np.rad2deg(pos_x)
             lat = np.rad2deg(pos_y)
-            _dbg("index, pos_x, pos_y, radius ",  i, lon, lat, radius) 
+            #depth = (1-depth) * R_EARTH_M
+            depth = depth * 1000.    
+           
+            _dbg("index, pos_x, pos_y, depth, radius ",  i, lon, lat, depth, radius) 
 
     if cid == 0: raise RuntimeError("No point-bearing blocks found.")
 
@@ -1133,12 +1205,6 @@ def plot_from_fp_plt(labels_json_path: str,
     # Add simple map features
     ax.coastlines(resolution="110m", linewidth=0.7)
     ax.add_feature(cfeature.LAND, edgecolor="none", facecolor="0.95")
-    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5)
-    gl.top_labels = False
-    gl.right_labels = False
-    gl.bottom_labels = True
-    gl.left_labels = False
-
 
     kwargs = dict(transform=ccrs.PlateCarree(), zorder=5, s=0.30,
                   edgecolors='none', linewidths=0)
@@ -1149,14 +1215,25 @@ def plot_from_fp_plt(labels_json_path: str,
     else:
         ax.scatter(lon_deg, lat_deg, color='crimson', **kwargs)
 
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5)
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.bottom_labels = True
+    gl.left_labels = True 
+
 
     plt.title('VTK Cartesian Points on Mercator (via lon/lat conversion)')
     plt.tight_layout()
   
     merc_file = pathlib.Path(pathlib.Path(labels_json_path).stem + "_plate").with_suffix(".png")
     merc_dir = pathlib.Path(labels_json_path).parent
-    _dbg(merc_dir / merc_file)
-    plt.savefig(merc_dir / merc_file, dpi=150, bbox_inches="tight")
+    filename = (merc_dir / merc_file)
+    _dbg(filename)
+    try:
+        plt.savefig(filename, dpi=150, bbox_inches="tight")
+    except Exception as e:
+        _dbg("e: ",  e)
+        plt.savefig(merc_file, dpi=150, bbox_inches="tight")
 
 def plot_compare_with_original_plt(labels_json_path: str, 
                                original_points,
@@ -1321,11 +1398,11 @@ def main():
     # for index in range(0,31):
     print("plot_compare_with_original :", fingerprints_jsonl, " with \n", canny_features_vtm)
 
-    plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
-                               indices=1)
+#   plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
+#                              indices=1)
     plot_from_fp_plt(fingerprints_jsonl, canny_features_vtm, \
-                      indices=7, show_matplotlib=False, mercator_2d=True)
-    plot_features_from_json(fingerprints_jsonl, show=False)
+                      indices=70, show_matplotlib=False, mercator_2d=True)
+#   plot_features_from_json(fingerprints_jsonl, show=False)
 #   b=34
 #   a = b/0
     return
