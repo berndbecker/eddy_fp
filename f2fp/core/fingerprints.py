@@ -117,11 +117,22 @@ def _coerce_point_cloud(feat) -> np.ndarray:
 # ...existing code...
 def build_fingerprint(X: np.ndarray, label: str | None = None, index: int | None = None) -> Fingerprint:
     """Build fingerprint in the input coordinate system (no geo conversion)."""
+
+    # IMPORTANT: keep coordinates as-is (no lon/lat/depth conversion)
+
     X = _coerce_point_cloud(X)
     assert X.ndim == 2 and X.shape[1] == 3, "Input X must be (N,3) array"
     assert X.shape[0] > 0, "Input X must not be empty"
+    # detect if X is ECEF unit sphere or Earth radius scale (norm 1 or R_EARTH_M)
+    norms = np.linalg.norm(X, axis=1)
+    if np.all((np.abs(norms - 1) < 0.1) | (np.abs(norms - R_EARTH_M) < 1000)):  # approximate check
+        lonlatdepth = cloud_to_lonlatdepth(X)
+    else:
+        lonlatdepth = X
 
-    # IMPORTANT: keep coordinates as-is (no lon/lat/depth conversion)
+    X_local, geo = _to_local_tangent(lonlatdepth)
+    Xc, pose = pca_align(X_local)
+    _set_pose_geo(pose, geo)
 
     grid = sparse_grid_12(Xc)
     metrics = _basic_metrics(Xc, grid)
@@ -456,9 +467,9 @@ def build_fingerprint_geo(X: np.ndarray, label: str | None = None, index: int | 
     X = _coerce_point_cloud(X)
     assert X.ndim == 2 and X.shape[1] == 3, "Input X must be (N,3) array"
     assert X.shape[0] > 0, "Input X must not be empty"
-    # detect if X is ECEF unit sphere or Earth radius scale (norm 1 or R_EARTH)
+    # detect if X is ECEF unit sphere or Earth radius scale (norm 1 or R_EARTH_M)
     norms = np.linalg.norm(X, axis=1)
-    if np.all((np.abs(norms - 1) < 0.1) | (np.abs(norms - R_EARTH) < 1000)):  # approximate check
+    if np.all((np.abs(norms - 1) < 0.1) | (np.abs(norms - R_EARTH_M) < 1000)):  # approximate check
         lonlatdepth = cloud_to_lonlatdepth(X)
     else:
         lonlatdepth = X
@@ -1343,39 +1354,39 @@ def plot_compare_with_original_gv(labels_json_path: str,
     selection = ["eddy", ]
     selection = ["eddy", "curtain"]
     for i in indices:
-      fp = fps[i]
-      if fp.get("type_label") in selection:
-        X_orig = clouds[fp.get("id")]
-        len_X_orig = len(X_orig)
-        _dbg("i, index, label, type_label, circularity, pose, len(cloud) ",
-            i, fp.get("id"), fp.get("label"), fp.get("type_label"), fp["metrics"].get("circularity"), 
-            fp.get("pose"), len_X_orig)
+        fp = fps[i]
+        if fp.get("type_label") in selection:
+            X_orig = clouds[fp.get("id")]
+            len_X_orig = len(X_orig)
+            _dbg("i, index, label, type_label, circularity, pose, len(cloud) ",
+                i, fp.get("id"), fp.get("label"), fp.get("type_label"), fp["metrics"].get("circularity"), 
+                fp.get("pose"), len_X_orig)
+    
+            n_points=len_X_orig
+            max_points_per_cloud = min(len_X_orig, n_points)
+            X_recon = reconstruct_points_from_fingerprint(
+                       fp, 
+                       n_points=max_points_per_cloud, 
+                       return_unit_sphere=True, 
+                       return_geo=False 
+                       )
 
-        n_points=len_X_orig
-        max_points_per_cloud = min(len_X_orig, n_points)
-        X_recon = reconstruct_points_from_fingerprint(
-                   fp, 
-                   n_points=max_points_per_cloud, 
-                   return_unit_sphere=True, 
-                   return_geo=False 
-                   )
+            X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
+            _dbg("X_orig [:3] ", X_orig [:3])     # ranges [ -1, 1  ] ranges [ -1, 1  ] ranges [-0.9 to -0.55 ] or so. 
+            _dbg("X_recon [:3] ", X_recon [:3])   # ranges [-45, 45 ] ranges [-45, 45 ] ranges [-0.9 to -0.55 ] or so. 
+            #_dbg("fp  ", fp)
 
-        X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
-        _dbg("X_orig [:3] ", X_orig [:3])     # ranges [ -1, 1  ] ranges [ -1, 1  ] ranges [-0.9 to -0.55 ] or so. 
-        _dbg("X_recon [:3] ", X_recon [:3])   # ranges [-45, 45 ] ranges [-45, 45 ] ranges [-0.9 to -0.55 ] or so. 
-        #_dbg("fp  ", fp)
+            X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
+            # create the point-cloud from the sample data
+            mesh_orig = pv.PolyData(X_orig)
+            mesh_recon = pv.PolyData(X_recon)
 
-        X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
-        # create the point-cloud from the sample data
-        mesh_orig = pv.PolyData(X_orig)
-        mesh_recon = pv.PolyData(X_recon)
+            #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
 
-        #_dbg("shape  of plotted fields: orig recon ", mesh_orig.points.shape, mesh_recon.points.shape)
+            plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
+            plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
 
-        plotter.add_mesh(mesh_orig, color="dodgerblue", point_size=5, render_points_as_spheres=True)
-        plotter.add_mesh(mesh_recon, color=_subtype_color(fp), point_size=5, render_points_as_spheres=True)
-
-        #sys.exit()
+            #sys.exit()
 
     plotter.add_coastlines("110m", color="black")
     html_file = pathlib.Path(pathlib.Path(labels_json_path).stem).with_suffix(".html")
@@ -1510,7 +1521,11 @@ def plot_from_fp_plt(labels_json_path: str,
             # ---- 2) Cartesian -> lon/lat ----
             # If your XYZ are already on a unit sphere (as GeoVista commonly uses), this is perfect.
             # If they are ECEF in meters, geo conversion still works (it normalizes to the sphere) when return_geo=True.
-            X_recon_ct = reconstruct_points_from_fingerprint(fp, n_points=n_points, return_geo=False )
+            X_recon_ct = reconstruct_points_from_fingerprint(fp, 
+                         n_points=n_points,
+                         return_unit_sphere=True, 
+                         return_geo=False 
+                         )
             X_recon = cloud_to_lonlatdepth_gv(X_recon_ct)
             _dbg(" reconstructed feature in lon, lat, depth (10 points) ", X_recon[:10])
             lon2, lat2, dep2 = X_recon[:, 0], X_recon[:, 1], X_recon[:, 2]
@@ -1795,7 +1810,7 @@ def main():
 
     canny_features_vtk = pathlib.Path(indir + filetag + "CSV/all_three_3D_cluster.vtk")
 #   canny_features_vtk = pathlib.Path(indir + filetag + "VTK/all_three_3D_cluster.vtk")
-#   canny_features_vtk = pathlib.Path(indir + filetag + "VTK/NW_atlantic_salinity_on_salinity_fronts.vtk")
+    canny_features_vtk = pathlib.Path(indir + filetag + "VTK/NW_atlantic_salinity_on_salinity_fronts.vtk")
 #   canny_features_vtk = pathlib.Path("synthetic_feature_point_cloud.vtk")
 
     canny_features_vtm = (canny_features_vtk.parent/canny_features_vtk.stem).with_suffix(".vtm")
@@ -1805,18 +1820,18 @@ def main():
     print(" point cloud from : ", canny_features_vtk) 
     print(" features point clouds to : ", canny_features_vtm) 
     print(" features finger prints to : ", fingerprints_jsonl) 
-    fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
-                                       features_out_vtk=canny_features_vtm)
+    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
+    #                                   features_out_vtk=canny_features_vtm)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
     # for index in range(0,31):
     print("plot_compare_with_original :", fingerprints_jsonl, " with \n", canny_features_vtm)
 
-    plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
-                               indices=10)
+    #plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
+    #                           indices=1)
     plot_from_fp_plt(fingerprints_jsonl, canny_features_vtm, \
-                      indices=10, show_matplotlib=False, mercator_2d=True)
+                      indices=1, show_matplotlib=False, mercator_2d=True)
 #   plot_features_from_json(fingerprints_jsonl, show=False)
     return
 
