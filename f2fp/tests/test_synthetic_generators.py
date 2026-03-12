@@ -127,15 +127,17 @@ def test_geovista_render():
     plotter.add_mesh(xyz2, color="red", render_lines_as_tubes=True, line_width=4)
     #X_all = np.asarray(xyz1, dtype=float)
     X_all = []  # ensure list for append
-    #X_all.append(np.asarray(xyz1, dtype=float)) # this is cartesian coordintes , not lon, lat, depth!
-    X_all.append(np.column_stack([lons1, lats1, np.zeros_like(lons1)]))
-    X_all.append(np.column_stack([lons2, lats2, np.zeros_like(lons2)]))
+    X_all.append(np.asarray(xyz1, dtype=float)) # this is cartesian coordintes , not lon, lat, depth!
+    X_all.append(np.asarray(xyz2, dtype=float)) # this is cartesian coordintes , not lon, lat, depth!
+    #X_all.append(np.column_stack([lons1, lats1, np.zeros_like(lons1)]))
+    #X_all.append(np.column_stack([lons2, lats2, np.zeros_like(lons2)]))
     for feat in features:
 #       print(feat)
 #       points = np.vstack([feat[1], feat[2], feat[3]])
         points = gv.common.to_cartesian(feat[1], feat[2], zlevel=-feat[3], zscale=zscale)
 #       print(points)
-        X_all.append(np.column_stack([feat[1], feat[2], -feat[3]]))
+        #X_all.append(np.column_stack([feat[1], feat[2], -feat[3]]))
+        X_all.append(np.asarray(points, dtype=float))
         plotter.add_mesh(points, color="blue", render_lines_as_tubes=True, line_width=4)
     
     # after building the raw point cloud array X (shape Nx3):
