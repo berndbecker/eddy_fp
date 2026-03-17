@@ -37,6 +37,8 @@ import matplotlib.cm as cm
 #from geovista.pantry.meshes import ZLEVEL_SCALE_CLOUD  # == 0.00001 ,1.e-5
 R_EARTH_M = 6_371_000.0
 ZLEVEL_SCALE_CLOUD=1./R_EARTH_M   # NOT! == 0.00001 ,1.e-5
+GRID_SIZE = 32  # higher resolution for tighter reconstruction
+
 
 
 from fast_hdbscan import HDBSCAN as FastHDBSCAN
@@ -179,10 +181,10 @@ def build_fingerprint(X: np.ndarray, label: str | None = None, index: int | None
 
 
     
-def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 128, seed: int = 42,
+def reconstruct_points_from_fingerprint(fp: dict, n_points: int = 528, seed: int = 42,
                                         jitter: bool = True,
-                                        cell_size_scale: float = 1.05,
-                                        jitter_scale: float = 0.7,
+                                        cell_size_scale: float = 0.99,
+                                        jitter_scale: float = 0.9,
                                         return_geo: bool = True,
                                         return_unit_sphere: bool = False) -> np.ndarray:
     """Approximate a point cloud from fingerprint grid + pose."""
@@ -325,109 +327,6 @@ def cloud_to_lonlatdepth_gv(mesh):
     return np.column_stack([lon, lat, depth]).astype(float)
 
 
-def reconstruct_points_from_fingerprint_old(fp: dict, n_points: int = 128, seed: int = 42,
-                                        jitter: bool = True,
-                                        cell_size_scale: float = 0.95,
-                                        jitter_scale: float = 0.9,
-                                        return_geo: bool = True,
-                                        return_unit_sphere: bool = False) -> np.ndarray:
-#   depth_levels = np.asarray(grid.get("depth_levels")) # fix actual ocean model depth layers!
-    depth_levels = [ 0.5, 1.6, 2.7, 3.9, 5.1, 6.5, 8.1, 9.8, 11.8, 14.0, 16.5, \
-                     19.4, 22.8, 26.6, 30.9, 35.7, 41.2, 47.2, \
-                     53.9, 61.1, 69.0, 77.6, 86.9, 97.0, 108.0, 120.0, 133.1, \
-                     147.4, 163.2, 180.5, 199.8, 221.1, 244.9, 271.4, \
-                     300.9, 333.9, 370.7, 411.8, 457.6, 508.6, 565.3, 628.0, 697.3, \
-                     773.4, 856.7, 947.4, 1045.9, 1152.0, 1265.9, \
-                     1387.4, 1516.4, 1652.6, 1795.7, 1945.3, 2101.0, 2262.4, 2429.0, \
-                     2600.4, 2776.0, 2955.6, 3138.6, 3324.6, \
-                     3513.4, 3704.7, 3898.0, 4093.2, 4290.0, 4488.2, 4687.6, \
-                     4888.1, 5089.5, 5291.7, 5494.6, 5698.1, 5902.1]
-    """Approximate a point cloud from fingerprint grid + pose."""
-    rng = np.random.default_rng(seed)
-    grid = fp.get("grid", {})
-    payload = grid.get("payload", [])
-    if not payload:
-        return np.zeros((0, 3), dtype=float)
-
-    cells = []
-    weights = []
-    for i in range(0, len(payload), 4):
-        ix, iy, iz, w = payload[i:i+4]
-        cells.append((int(ix), int(iy), int(iz)))
-        weights.append(float(w))
-    weights = np.asarray(weights, dtype=float)
-    weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
-
-    b = int(grid.get("nx", 12))
-    counts = np.floor(weights * n_points).astype(int)
-    rem = n_points - counts.sum()
-    if rem > 0:
-        extra = rng.choice(len(cells), size=rem, p=weights)
-        for j in extra:
-            counts[j] += 1
-
-    pts = []
-    cell_size = (2.0 / b) * cell_size_scale
-
-    for (ix, iy, iz), c in zip(cells, counts):
-        if c <= 0:
-            continue
-        cx = (ix + 0.5) / b * 2.0 - 1.0
-        cy = (iy + 0.5) / b * 2.0 - 1.0
-#       cz = (iz + 0.5) / b * 2.0 - 1.0
-        cz = depth_levels[iz]
-        if jitter:
-            jitter_xyz = (rng.random((c, 3)) - 0.5) * cell_size * jitter_scale
-            base = np.array([cx, cy, cz], dtype=float)
-            pts.append(base + jitter_xyz)
-        else:
-            pts.append(np.repeat([[cx, cy, cz]], c, axis=0))
-
-    Xc = np.vstack(pts) if pts else np.zeros((0, 3), dtype=float)
-
-    center = np.asarray(grid.get("center", [0.0, 0.0, 0.0]), dtype=float)
-    half = np.asarray(grid.get("half", [1.0, 1.0, 1.0]), dtype=float)
-    Xc = Xc * half + center
-
-    pose = fp.get("pose", {})
-    R = np.asarray(pose.get("R"), dtype=float)
-    c = np.asarray(pose.get("centroid"), dtype=float)
-    s = float(pose.get("scale_s", 1.0))
-    Xr = Xc * s
-    X0 = Xr @ R
-    X_local = X0 + c
-
-    geo = pose.get("geo")
-
-    # If geo is absent, X_local is already in original (local) coordinates
-    if return_unit_sphere:
-        if not geo:
-            return X_local.astype(float)
-        X_geo = _from_local_tangent(X_local, geo)  # lon, lat, depth(+down)
-        lon, lat, depth = X_geo[:, 0], X_geo[:, 1], X_geo[:, 2]
-        h = -depth  # height (+up)
-        crs_geo = CRS.from_epsg(4979)
-        crs_ecef = CRS.from_epsg(4978)
-        tf = Transformer.from_crs(crs_geo, crs_ecef, always_xy=True)
-        x, y, z = tf.transform(lon, lat, h)
-        X_ecef = np.column_stack([x, y, z]) / R_EARTH_M
-        return X_ecef.astype(float)
-
-    if return_geo:
-        if geo:
-            X_geo = _from_local_tangent(X_local, geo)
-            lon = X_geo[:, 0]
-            lat = X_geo[:, 1]
-            depth = X_geo[:, 2]
-            mask = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(depth)
-            mask &= (lat > -89.0) & (lat < 89.0)
-            mask &= ~((np.abs(lon) < 1e-6) & (np.abs(lat) < 1e-6))
-            return X_geo[mask]
-        # No geo: treat X_local as ECEF and convert to lon/lat/depth
-        return cloud_to_lonlatdepth(X_local)
-
-    return X_local
-# ...existing code...
 def build_fingerprint_geo(X: np.ndarray, label: str | None = None, index: int | None = None) -> Fingerprint:
     """ keys in fingerprint:
     pose
@@ -504,8 +403,6 @@ def _normalize_metrics(metrics: dict) -> dict:
         "circularity": float(metrics.get("circularity", 0.0)),
         "nnz": int(metrics.get("nnz", 0)),
     }
-
-GRID_SIZE = 22  # higher resolution for tighter reconstruction
 
 def sparse_grid_12(Xc: np.ndarray) -> dict:
     """Create a sparse grid representation from canonical coordinates."""
@@ -1040,6 +937,94 @@ def run_pipeline_from_points(points: np.ndarray,
     save_fingerprints_json(fps_dicts, out_path)
     print("fingerprints dictionary saved to ", out_path)
     return fps_dicts
+# ...existing code...
+def _points_from_vtk(vtk_path: str) -> np.ndarray:
+    res = load_point_clouds_vtk(vtk_path)
+    if not res:
+        return np.zeros((0, 3), dtype=float)
+    # res can be (points, mesh) or (clouds, data) or list
+    if isinstance(res, tuple):
+        clouds = res[0]
+        if isinstance(clouds, list):
+            return clouds[0] if len(clouds) == 1 else np.concatenate(clouds, axis=0)
+        if isinstance(clouds, np.ndarray):
+            return np.asarray(clouds, dtype=float)
+    if isinstance(res, list):
+        return res[0] if len(res) == 1 else np.concatenate(res, axis=0)
+    return np.asarray(res, dtype=float)
+
+def detect_features_from_vtk(vtk_path: str,
+                             features_out_vtk: str,
+                             min_cluster_size=1450,
+                             eps=0.0001,
+                             random_state=42,
+                             first_stage: str = "iterative") -> list[np.ndarray]:
+    """Stage 1: feature detection (cluster only) and save clusters as .vtm."""
+    points = _points_from_vtk(vtk_path)
+    if points.size == 0:
+        return []
+    if first_stage == "iterative":
+        labels1 = _cluster_points_raw_iterative(points, min_cluster_size=min_cluster_size, eps=eps)
+    elif first_stage == "adaptive":
+        labels1 = _cluster_points_raw_adaptive(points, min_cluster_size=min_cluster_size, eps=eps)
+    else:
+        labels1 = _cluster_points_raw(points, min_cluster_size=min_cluster_size, eps=eps)
+
+    clusters = _split_clusters(points, labels1)
+    if not clusters and points.size:
+        clusters = [points]
+
+    save_point_clouds_vtk(pathlib.Path(features_out_vtk), clusters)
+    return clusters
+
+def fingerprint_features_from_vtm(vtm_path: str,
+                                  out_path: str,
+                                  random_state=42,
+                                  max_workers: int | None = None) -> list[dict]:
+    """Stage 2: build fingerprints from cluster VTM."""
+    clouds, _ = load_point_clouds_vtm(vtm_path)
+    if not clouds:
+        return []
+    indexed = [(c, i) for i, c in enumerate(clouds)]
+    use_parallel = len(clouds) > 4
+    if use_parallel:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            fps = list(ex.map(_build_fp_with_index, indexed))
+    else:
+        fps = [build_fingerprint(c, index=i) for i, c in indexed]
+
+    fps_dicts = [to_dict(fp) for fp in fps]
+    save_fingerprints_json(fps_dicts, pathlib.Path(out_path))
+    return fps_dicts
+
+def identify_features_from_fingerprints(json_path: str,
+                                        min_cluster_size=20,
+                                        random_state=42) -> list[dict]:
+    """Stage 3: feature identification from fingerprints."""
+    try:
+        from .cluster import embed_features, cluster_labels
+    except Exception:
+        from cluster import embed_features, cluster_labels
+
+    fps = load_fingerprints_json(json_path)
+    if not fps:
+        return []
+
+    keys = ["linearity", "planarity", "scattering", "circularity", "nnz"]
+    M = _stack_metrics(fps, keys)
+    emb = embed_features(M)
+    labels2 = cluster_labels(emb, min_cluster_size=min_cluster_size, random_state=random_state)
+
+    uniq = sorted(set(int(x) for x in labels2))
+    mapping = {lbl: f"feature_kind_{i}" for i, lbl in enumerate(uniq)}
+
+    for rec, lbl in zip(fps, labels2):
+        rec["label"] = mapping.get(int(lbl), "feature_kind_-1")
+        rec["type_label"] = _type_label_from_metrics(rec["metrics"])
+
+    save_fingerprints_json(fps, pathlib.Path(json_path))
+    return fps
 
 def run_pipeline_from_vtk(vtk_path: str,
                           out_path: str,
@@ -1180,100 +1165,6 @@ def to_dict(fp: Fingerprint) -> dict:
         out["scale"] = fp.scale
     return out
 
-def reconstruct_points_from_fingerprint_geo(fp: dict, n_points: int = 128, seed: int = 42,
-                                        jitter: bool = True,
-                                        cell_size_scale: float = 0.5,
-                                        jitter_scale: float = 1.,
-                                        return_geo: bool = True,
-                                        return_unit_sphere: bool = False) -> np.ndarray:
-    """Approximate a point cloud from fingerprint grid + pose."""
-    rng = np.random.default_rng(seed)
-    grid = fp.get("grid", {})
-    payload = grid.get("payload", [])
-    if not payload:
-        return np.zeros((0, 3), dtype=float)
-
-    _dbg("return_geo = ", return_geo)
-    cells = []
-    weights = []
-    for i in range(0, len(payload), 4):
-        ix, iy, iz, w = payload[i:i+4]
-        cells.append((int(ix), int(iy), int(iz)))
-        weights.append(float(w))
-    weights = np.asarray(weights, dtype=float)
-    weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
-
-    b = int(grid.get("nx", 12))
-    # allocate counts per cell
-    counts = np.floor(weights * n_points).astype(int)
-    # distribute remaining points
-    rem = n_points - counts.sum()
-    if rem > 0:
-        extra = rng.choice(len(cells), size=rem, p=weights)
-        for j in extra:
-            counts[j] += 1
-
-    pts = []
-
-    cell_size = (2.0 / b) * cell_size_scale
-
-    for (ix, iy, iz), c in zip(cells, counts):
-        if c <= 0:
-            continue
-        # cell center in [-1,1]
-        cx = (ix + 0.5) / b * 2.0 - 1.0
-        cy = (iy + 0.5) / b * 2.0 - 1.0
-        cz = (iz + 0.5) / b * 2.0 - 1.0
-        if jitter:
-            # uniform jitter within the cell
-            jitter_xyz = (rng.random((c, 3)) - 0.5) * cell_size * jitter_scale
-            base = np.array([cx, cy, cz], dtype=float)
-            pts.append(base + jitter_xyz)
-        else:
-            pts.append(np.repeat([[cx, cy, cz]], c, axis=0))
-    Xc = np.vstack(pts) if pts else np.zeros((0, 3), dtype=float)
-
-# Denormalize if grid has bounds
-    grid = fp.get("grid", {})
-    center = np.asarray(grid.get("center", [0.0, 0.0, 0.0]), dtype=float)
-    half = np.asarray(grid.get("half", [1.0, 1.0, 1.0]), dtype=float)
-    Xc = Xc * half + center
-
-    pose = fp.get("pose", {})
-    R = np.asarray(pose.get("R"), dtype=float)
-    c = np.asarray(pose.get("centroid"), dtype=float)
-    s = float(pose.get("scale_s", 1.0))
-    Xr = Xc * s
-    X0 = Xr @ R
-    X_local = X0 + c
-
-    geo = pose.get("geo")
-
-    if return_unit_sphere:
-        print("geo ", geo)
-        if not geo:
-            raise ValueError("return_unit_sphere=True requires pose.geo")
-        X_geo = _from_local_tangent(X_local, geo)  # lon, lat, depth(+down)
-        lon, lat, depth = X_geo[:, 0], X_geo[:, 1], X_geo[:, 2]
-        h = -depth  # height (+up)
-        crs_geo = CRS.from_epsg(4979)
-        crs_ecef = CRS.from_epsg(4978)
-        tf = Transformer.from_crs(crs_geo, crs_ecef, always_xy=True)
-        x, y, z = tf.transform(lon, lat, h)
-        X_ecef = np.column_stack([x, y, z]) / R_EARTH_M
-        return X_ecef.astype(float)
-
-    if return_geo and geo:
-        X_geo = _from_local_tangent(X_local, geo)
-        lon = X_geo[:, 0]
-        lat = X_geo[:, 1]
-        depth = X_geo[:, 2]
-        mask = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(depth)
-        mask &= (lat > -89.0) & (lat < 89.0)
-        mask &= ~((np.abs(lon) < 1e-6) & (np.abs(lat) < 1e-6))
-        return X_geo[mask]
-
-    return X_local
 
 def summarize_metrics(fps: list[dict]):
     keys = ["linearity", "planarity", "scattering", "circularity"]
@@ -1298,7 +1189,7 @@ def _downsample_points(X: np.ndarray, max_points: int | None, seed: int = 42) ->
 def plot_compare_with_original_gv(labels_json_path: str, 
                                original_points,
                                index: int = 0,
-                               n_points: int = 512,
+                               n_points: int = 612,
                                zlevel_scale: float = ZLEVEL_SCALE_CLOUD,
                                max_features: int | None = None,
                                max_points_per_cloud: int | None = 256,
@@ -1372,8 +1263,8 @@ def plot_compare_with_original_gv(labels_json_path: str,
                        )
 
             X_orig = _downsample_points(X_orig, max_points_per_cloud, seed=42)
-            _dbg("X_orig [:3] ", X_orig [:3])     # ranges [ -1, 1  ] ranges [ -1, 1  ] ranges [-0.9 to -0.55 ] or so. 
-            _dbg("X_recon [:3] ", X_recon [:3])   # ranges [-45, 45 ] ranges [-45, 45 ] ranges [-0.9 to -0.55 ] or so. 
+            #_dbg("X_orig [:3] ", X_orig [:3])     # ranges [ -1, 1  ] ranges [ -1, 1  ] ranges [-0.9 to -0.55 ] or so. 
+            #_dbg("X_recon [:3] ", X_recon [:3])   # ranges [-45, 45 ] ranges [-45, 45 ] ranges [-0.9 to -0.55 ] or so. 
             #_dbg("fp  ", fp)
 
             X_recon = _downsample_points(X_recon, max_points_per_cloud, seed=42)
@@ -1488,7 +1379,7 @@ def cloud_to_lonlatdepth(cloud: np.ndarray) -> np.ndarray:
 def plot_from_fp_plt(labels_json_path: str, 
                      original_points,
                      index: int = 0,
-                     n_points: int = 128,
+                     n_points: int = 265,
                      max_features: int | None = None,
                      max_points_per_cloud: int | None = 256,
                      show_matplotlib: bool = False,
@@ -1506,7 +1397,7 @@ def plot_from_fp_plt(labels_json_path: str,
 
     lon_all1, lat_all1, dep_all1 = [], [], []
     lon_all2, lat_all2, dep_all2 = [], [], []
-    circles = []  # (lon0, lat0, radius_m)
+    circles = []  # list of dicts: {"id":..., "lon":..., "lat":..., "radius_m":...}
     cid = 0
 
     # only plot eddies
@@ -1515,7 +1406,7 @@ def plot_from_fp_plt(labels_json_path: str,
 
         if fp.get("type_label") in selection:  # filter out what is in selections, eddies only.
             X_orig = cloud_to_lonlatdepth_gv(clouds[fp.get("id")])
-            _dbg(" orig feature in lon, lat, depth (10 points) ", X_orig[:10])
+            #_dbg(" orig feature in lon, lat, depth (10 points) ", X_orig[:10])
             lon1, lat1, dep1 = X_orig[:, 0], X_orig[:, 1], X_orig[:, 2]
 
             # ---- 2) Cartesian -> lon/lat ----
@@ -1527,7 +1418,7 @@ def plot_from_fp_plt(labels_json_path: str,
                          return_geo=False 
                          )
             X_recon = cloud_to_lonlatdepth_gv(X_recon_ct)
-            _dbg(" reconstructed feature in lon, lat, depth (10 points) ", X_recon[:10])
+            #_dbg(" reconstructed feature in lon, lat, depth (10 points) ", X_recon[:10])
             lon2, lat2, dep2 = X_recon[:, 0], X_recon[:, 1], X_recon[:, 2]
             #_dbg("index, type_label, circularity, pose, len(cloud) ",
             #     i, fp.get("index"), fp.get("label"), fp.get("type_label"), fp["metrics"].get("circularity"), 
@@ -1544,7 +1435,7 @@ def plot_from_fp_plt(labels_json_path: str,
             
             X_orig_local, geo_loc = _to_local_tangent(X_recon, depth_positive_down=True)
 
-            _dbg ("X_orig_local ", X_orig_local[:10], geo_loc )
+            #_dbg ("X_orig_local ", X_orig_local[:10], geo_loc )
 
             pos_x, pos_y, pos_z, radius =  estimate_eddy_geometry(X_orig_local)  # needs cartesian coordinates, not geo!
 
@@ -1556,9 +1447,22 @@ def plot_from_fp_plt(labels_json_path: str,
             #sys.exit()
             # store circle center from geo_loc
             if geo_loc:
-                circles.append((geo_loc["lon0"], geo_loc["lat0"], radius))
-
+                circles.append({
+                    "id": int(fp.get("id")) if fp.get("id") is not None else int(i),
+                    "lon": float(geo_loc["lon0"]),
+                    "lat": float(geo_loc["lat0"]),
+                    "radius_m": float(radius),
+                })
     if cid == 0: raise RuntimeError("No point-bearing blocks found.")
+
+    # write eddy centers to JSONL alongside canny_feature_vtk
+    if isinstance(original_points, (str, pathlib.Path)):
+        p = pathlib.Path(original_points)
+        out_path = p.parent / f"{p.stem}_eddies.jsonl"
+        with out_path.open("w", encoding="utf-8") as f:
+            for row in circles:
+                f.write(json.dumps(row) + "\n")
+        print("saved eddy centers to", out_path)
 
     lon1 = np.concatenate([np.asarray(d).ravel() for d in lon_all1]) if lon_all1 else np.array([])
     lon2 = np.concatenate([np.asarray(d).ravel() for d in lon_all2]) if lon_all2 else np.array([])
@@ -1587,7 +1491,11 @@ def plot_from_fp_plt(labels_json_path: str,
     ax.set_ylabel("Latitude (°)")
 
     # plot circles (approx meters -> degrees)
-    for lon0, lat0, r_m in circles:
+    for c in circles:
+        idx = c.get("id")
+        lon0 = c.get("lon")
+        lat0 = c.get("lat")
+        r_m = c.get("radius_m")
         if not np.isfinite([lon0, lat0, r_m]).all():
             continue
         # degrees per meter
@@ -1610,12 +1518,15 @@ def plot_from_fp_plt(labels_json_path: str,
     else:
         ax.scatter(lon2, lat2, color='crimson', **kwargs)
 
+    ax.axis("off")
+   
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5)
-#   plt.axis("off")
+    plt.axis("off")
+    plt.box(False)
     ax.set_xticks([])  # Remove x-axis ticks
     ax.set_yticks([])  # Remove y-axis ticks
-#   ax.top_labels = False
-#   ax.right_labels = False
+    ax.top_labels = False
+    ax.right_labels = False
 #   ax.bottom_labels = False
 #   ax.left_labels = False
 #   gl.top_labels = False
@@ -1779,10 +1690,8 @@ def main():
         from synthetic import SynthConfig, mixed_point_cloud, save_point_cloud_vtk
 
 
-    parser = argparse.ArgumentParser(
-        description="Plot synthetic features and clustered outputs."
-    )
-
+    
+    parser = argparse.ArgumentParser(description="Fingerprint pipeline")
     parser.add_argument(
         "outdir_parent",
         nargs="?",
@@ -1797,7 +1706,9 @@ def main():
         help="enter a file name tag for output filenames",
     )
 
+
     args = parser.parse_args()
+
     print("List of items: {}".format(args))
     #   orca12data = pathlib.Path(args.outdir_nametag)
     indir = args.outdir_parent
@@ -1820,19 +1731,40 @@ def main():
     print(" point cloud from : ", canny_features_vtk) 
     print(" features point clouds to : ", canny_features_vtm) 
     print(" features finger prints to : ", fingerprints_jsonl) 
-    #fps_dicts = run_pipeline_from_vtk(canny_features_vtk, fingerprints_jsonl, \
-    #                                   features_out_vtk=canny_features_vtm)
+
+    min_cluster_size=1450
+    eps = 0.0001
+    random_state = 42
+    max_workers = 24
+    first_stage= "iterative"
+
+    """
+    """
+    # "detect":
+    detect_features_from_vtk(canny_features_vtk, canny_features_vtm,
+                             min_cluster_size=min_cluster_size,
+                             eps=eps,
+                             random_state=random_state,
+                             first_stage=first_stage)
+    # make "fingerprint":
+    fingerprint_features_from_vtm(canny_features_vtk, fingerprints_jsonl,
+                                  random_state=random_state,
+                                  max_workers=max_workers)
+    # "identify":
+    identify_features_from_fingerprints( fingerprints_jsonl,
+                                        min_cluster_size=min_cluster_size,
+                                        random_state=random_state)
 
     # plot_features_from_json("core/synthetic_features.json", title="Synthetic Features")
     # plot_features_from_json("run_fp.jsonl", title="Clustered Features")
     # for index in range(0,31):
     print("plot_compare_with_original :", fingerprints_jsonl, " with \n", canny_features_vtm)
 
-    #plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
-    #                           indices=1)
+    plot_compare_with_original_gv(fingerprints_jsonl, canny_features_vtm, \
+                               indices=1)
     plot_from_fp_plt(fingerprints_jsonl, canny_features_vtm, \
                       indices=1, show_matplotlib=False, mercator_2d=True)
-#   plot_features_from_json(fingerprints_jsonl, show=False)
+    plot_features_from_json(fingerprints_jsonl, show=False)
     return
 
 if __name__ == "__main__":
